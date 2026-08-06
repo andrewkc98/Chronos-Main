@@ -71,5 +71,10 @@ NETWORK_URL=smb://nas.example.com/TimeMachine
 # Seconds between remount checks by the persistent monitor.
 # LAUNCH_INTERVAL=300
 
+# If a disk image password prompt goes unanswered, wait this many seconds before
+# requesting another mount. Without it, every check would stack another dialog.
+# Set to 0 to disable the cooldown (not recommended).
+# GUI_MOUNT_COOLDOWN=1800
+
 # Start a first backup once setup succeeds.
 # START_FIRST_BACKUP=true

@@ -46,6 +46,7 @@ substitute() {
         -e 's|${MONITOR_SCRIPT_PATH}|/usr/local/lib/chronos-gn/chronos-gn-remount-monitor.sh|g' \
         -e 's|${LAUNCH_AGENT_LABEL}|io.github.example.chronos-gn|g' \
         -e 's|${LAUNCH_INTERVAL}|300|g' \
+        -e 's|${GUI_MOUNT_COOLDOWN}|1800|g' \
         "$1"
 }
 

@@ -43,6 +43,7 @@ See [`examples/chronos-gn.conf.example`](../examples/chronos-gn.conf.example) fo
 | `HELPER_DIR` | `--helper-dir` | `/usr/local/lib/chronos-gn` | Where the generated helper and monitor live |
 | `LOG_FILE` | `--log-file` | `~/Library/Logs/chronos-gn/chronos-gn.log` | Main setup log |
 | `LAUNCH_INTERVAL` | `--launch-interval` | `300` | Seconds between remount checks |
+| `GUI_MOUNT_COOLDOWN` | `--gui-mount-cooldown` | `1800` | After an unanswered disk image password prompt, seconds to wait before asking again. `0` disables the cooldown. |
 | `START_FIRST_BACKUP` | `--no-start-backup` | `true` | Start a backup after setup |
 
 ## Flags with no config equivalent
@@ -78,5 +79,7 @@ Prefer the interactive prompt for the password. Use the environment variable onl
 **`LOG_FILE`** — the default lives in the console user's home. Setting this explicitly counts as an override and relaxes the check that refuses a default log path inside a world-writable directory, so pick a directory only you can write to. A log path that is a symlink is refused either way.
 
 **`SIZE`** — a sparsebundle only consumes what it uses, but Time Machine treats this as the disk size and will prune backups against it. Sizing it near your share quota is normal; sizing it larger than the share can hold means Time Machine will not prune until the share itself fills.
+
+**`GUI_MOUNT_COOLDOWN`** — this exists because an unanswered password dialog is invisible to every state check the remount helper makes: the volume is not mounted and the image is not attached, so without a cooldown each pass concludes "mount it" and stacks another dialog behind the first. Lower it if you want faster recovery after dismissing a prompt; raise it if you are often away from the machine. Setting it to `0` restores the pre-3.0 behavior, which is not recommended.
 
 **`VOLUME_NAME`** — two machines can share one `VOLUME_NAME` safely; the sparsebundle name is derived from computer name plus MAC address, so each machine gets its own image. But the mount point `/Volumes/<VOLUME_NAME>` is per-machine, so this only matters locally.

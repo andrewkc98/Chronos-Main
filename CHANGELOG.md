@@ -19,6 +19,7 @@ First public release. The project was renamed from `chronos` to `chronos-gn` and
 
 ### Added
 - Config file support with a documented search order (`--config`, `$CHRONOS_GN_CONFIG`, `~/.config/chronos-gn/config`, `/etc/chronos-gn/config`) and an annotated template in `examples/`. Files are parsed rather than sourced, keys are allowlisted, and `ENCRYPTION_PASSWORD` is rejected.
+- `--gui-mount-cooldown` / `GUI_MOUNT_COOLDOWN` to control how long to wait after an unanswered password prompt before requesting a mount again.
 - `--label-prefix` and `--helper-dir` so the install location and LaunchAgent namespace are no longer hardcoded.
 - Automatic detection and migration of a pre-3.0 `chronos` install. Consent is requested up front; removal runs only after the new install is confirmed working. The sparsebundle, the Time Machine destination, and Keychain are never touched. `--no-migrate` opts out.
 - `--log-file` in the uninstaller, plus `--config` and `--label-prefix` so it can clean up a customized install.
@@ -26,6 +27,7 @@ First public release. The project was renamed from `chronos` to `chronos-gn` and
 - CI running `bash -n`, `shellcheck`, and no-NAS smoke tests.
 
 ### Fixed
+- **Stacked disk image password prompts after going off-network.** Three compounding causes: `share_path_ready` trusted cached metadata, so a stale SMB mountpoint looked healthy; `refresh_share_access` short-circuited on that state before reaching the `network_host_reachable` guard, bypassing the popup suppression added in 2.2.1; and the mount retry loop re-issued a GUI mount request up to three times per run even though `open` returns immediately and the previous dialog was still waiting for input. At the default 300s interval an unattended machine accumulated roughly three dozen dialogs an hour. Reachability is now a precondition of share readiness, exactly one GUI mount request is made per run, a new `GUI_MOUNT_COOLDOWN` (default 1800s) suppresses requests after an unanswered prompt, and `pgrep -x DiskImageMounter` blocks a request while a dialog is on screen.
 - **Predictable log path in a world-writable directory.** `/tmp/chronos.log` was truncated by a script that then escalates via `sudo`, making it a symlink-swap target for any local user. The default now lives in the console user's home with a `0700` directory; symlinked log paths are refused, and a default path inside a world-writable directory is refused unless `--log-file` is passed explicitly.
 - The uninstaller did not remove `chronos-remount-monitor.sh`, and looked for LaunchAgent logs named `launchagent.out`/`launchagent.err`, which the installer stopped producing in 2.2.1. Both left files behind on uninstall.
 - The uninstaller reported version `1.0.0` while shipping alongside a `2.2.1` installer. Both scripts now carry the project version.
@@ -44,7 +46,7 @@ First public release. The project was renamed from `chronos` to `chronos-gn` and
 - `hdiutil attach -agentpass` as a third fallback after DiskImageMounter and Launch Services `open`.
 
 ### Fixed
-- Finder connection dialogs no longer appear repeatedly when off-network; the helper checks host reachability before making any GUI mount call.
+- Finder connection dialogs appear less often when off-network; the helper checks host reachability before making a GUI mount call. This turned out to be incomplete — the guard was bypassed whenever a stale SMB mount still looked healthy locally. See the 3.0.0 entry.
 - Interrupted `sleep` after wake or signal delivery no longer terminates the helper or monitor under `set -e`.
 
 ## [2.1.1] — Pre-release (private)

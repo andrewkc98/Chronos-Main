@@ -29,6 +29,7 @@ FORCE_CLEAN_PARTIAL=0
 MIGRATE_LEGACY=1
 MIGRATION_APPROVED=0
 LAUNCH_INTERVAL=300
+GUI_MOUNT_COOLDOWN=1800
 SIZE="2000g"
 FILESYSTEM="APFS"
 DESTINATION="/Volumes/TimeMachine"
@@ -109,6 +110,8 @@ Behavior:
       --no-launchagent            Skip LaunchAgent helper setup
       --launchagent-only          Update only the LaunchAgent, helper, and monitor assets
       --launch-interval SECONDS   Remount recheck interval for the persistent monitor (default: 300)
+      --gui-mount-cooldown SECS   After an unanswered disk image password prompt, wait this
+                                  long before asking again (default: 1800, 0 disables)
       --no-start-backup           Skip starting the first backup
       --force-clean-partial       Remove known partial bundles without prompting
       --no-migrate                Do not migrate a legacy 'chronos' install if one is found
@@ -432,6 +435,7 @@ apply_config_value() {
         HELPER_DIR) HELPER_DIR="$value" ;;
         LABEL_PREFIX) LABEL_PREFIX="$value" ;;
         LAUNCH_INTERVAL) LAUNCH_INTERVAL="$value" ;;
+        GUI_MOUNT_COOLDOWN) GUI_MOUNT_COOLDOWN="$value" ;;
         PASSWORD_ENV_VAR) PASSWORD_ENV_VAR="$value" ;;
         ENABLE_ENCRYPTION) ENABLE_ENCRYPTION="$(parse_bool "$value" "ENABLE_ENCRYPTION in ${origin}")" ;;
         START_FIRST_BACKUP) START_FIRST_BACKUP="$(parse_bool "$value" "START_FIRST_BACKUP in ${origin}")" ;;
@@ -603,6 +607,10 @@ parse_args() {
                 LAUNCH_INTERVAL="${2:?Missing value for $1}"
                 shift 2
                 ;;
+            --gui-mount-cooldown)
+                GUI_MOUNT_COOLDOWN="${2:?Missing value for $1}"
+                shift 2
+                ;;
             --no-start-backup)
                 START_FIRST_BACKUP=0
                 shift
@@ -670,6 +678,10 @@ validate_destination() {
 
 validate_launch_interval() {
     [[ "$LAUNCH_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "Launch interval must be a positive integer."
+}
+
+validate_gui_mount_cooldown() {
+    [[ "$GUI_MOUNT_COOLDOWN" =~ ^[0-9]+$ ]] || die "GUI mount cooldown must be a non-negative integer."
 }
 
 validate_label_prefix() {
@@ -769,6 +781,7 @@ validate_setup() {
     validate_destination
     validate_url
     validate_launch_interval
+    validate_gui_mount_cooldown
     validate_label_prefix
     validate_helper_dir
 
@@ -1288,6 +1301,8 @@ IFS=\$'\\n\\t'
 
 LOG_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-remount.log"
 LOCK_DIR="${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
+GUI_MOUNT_STATE_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-gui-mount.state"
+GUI_MOUNT_COOLDOWN="${GUI_MOUNT_COOLDOWN}"
 DISK_IMAGE_MOUNTER_APP="/System/Library/CoreServices/DiskImageMounter.app"
 NETWORK_URL="${NETWORK_URL}"
 SHARE_HOST="${SHARE_HOST}"
@@ -1352,7 +1367,17 @@ path_is_accessible() {
 }
 
 share_path_ready() {
-    is_mountpoint "\$DESTINATION" && path_is_accessible "\$DESTINATION"
+    is_mountpoint "\$DESTINATION" || return 1
+
+    # After the link drops, macOS leaves the SMB mountpoint in `mount` output and
+    # answers stat/ls from cached metadata, so the local checks below happily
+    # report a dead share as healthy. Without this reachability gate, a stale
+    # mount walks straight past the popup suppression and we ask DiskImageMounter
+    # to open a sparsebundle whose backing store is gone -- which is exactly when
+    # macOS puts up the "enter password" dialog.
+    network_host_reachable || return 1
+
+    path_is_accessible "\$DESTINATION"
 }
 
 bundle_path_ready() {
@@ -1370,8 +1395,29 @@ bundle_is_attached() {
     /usr/bin/hdiutil info 2>/dev/null | /usr/bin/grep -Fq "\$BUNDLE_PATH"
 }
 
+# Memoized briefly: share_path_ready() now consults this, and that runs inside
+# per-second wait loops where an uncached 2s connect attempt would dominate.
+NETWORK_REACHABLE_CACHE=""
+NETWORK_REACHABLE_CACHE_AT=0
+
 network_host_reachable() {
-    /usr/bin/nc -z -w 2 "\$SHARE_HOST" "\$SHARE_PORT" >/dev/null 2>&1
+    local now=""
+    now="\$(date +%s)"
+
+    if [[ -n "\$NETWORK_REACHABLE_CACHE" ]] && [[ \$((now - NETWORK_REACHABLE_CACHE_AT)) -lt 5 ]]; then
+        [[ "\$NETWORK_REACHABLE_CACHE" == "yes" ]]
+        return
+    fi
+
+    NETWORK_REACHABLE_CACHE_AT="\$now"
+
+    if /usr/bin/nc -z -w 2 "\$SHARE_HOST" "\$SHARE_PORT" >/dev/null 2>&1; then
+        NETWORK_REACHABLE_CACHE="yes"
+        return 0
+    fi
+
+    NETWORK_REACHABLE_CACHE="no"
+    return 1
 }
 
 wait_for_mountpoint() {
@@ -1449,6 +1495,50 @@ refresh_share_access() {
     request_share_mount
 }
 
+# An unanswered password dialog is invisible to every check above: the volume is
+# not mounted, the image is not attached, so each pass concludes "mount it" and
+# stacks another dialog on top of the one already waiting. These two guards are
+# what stop a walk-away from turning into a screen full of prompts.
+gui_mount_prompt_pending() {
+    /usr/bin/pgrep -x DiskImageMounter >/dev/null 2>&1
+}
+
+gui_mount_cooldown_active() {
+    local last=""
+    local now=""
+
+    [[ "\$GUI_MOUNT_COOLDOWN" -gt 0 ]] || return 1
+    [[ -f "\$GUI_MOUNT_STATE_FILE" ]] || return 1
+
+    last="\$(cat "\$GUI_MOUNT_STATE_FILE" 2>/dev/null || true)"
+    [[ "\$last" =~ ^[0-9]+\$ ]] || return 1
+
+    now="\$(date +%s)"
+    [[ \$((now - last)) -lt "\$GUI_MOUNT_COOLDOWN" ]]
+}
+
+begin_gui_mount_cooldown() {
+    date +%s >"\$GUI_MOUNT_STATE_FILE" 2>/dev/null || true
+}
+
+clear_gui_mount_cooldown() {
+    rm -f "\$GUI_MOUNT_STATE_FILE" >/dev/null 2>&1 || true
+}
+
+gui_mount_allowed() {
+    if gui_mount_prompt_pending; then
+        log WARN "A disk image password prompt is already open; not requesting another mount"
+        return 1
+    fi
+
+    if gui_mount_cooldown_active; then
+        log INFO "Still in cooldown after an unanswered password prompt; not requesting another mount"
+        return 1
+    fi
+
+    return 0
+}
+
 mount_sparsebundle_with_diskimagemounter() {
     if [[ ! -d "\$DISK_IMAGE_MOUNTER_APP" ]]; then
         log WARN "DiskImageMounter app is missing at \$DISK_IMAGE_MOUNTER_APP"
@@ -1490,47 +1580,55 @@ mount_sparsebundle_with_hdiutil() {
 attempt_sparsebundle_mount() {
     local attempt=1
 
+    # Refreshing the share is safe to retry: it makes no GUI request while the
+    # host is unreachable.
     while [[ "\$attempt" -le 3 ]]; do
-        if ! refresh_share_access; then
-            log WARN "Share refresh attempt \${attempt}/3 failed for \$DESTINATION"
-            sleep 5 || true
-            attempt=\$((attempt + 1))
-            continue
+        if refresh_share_access && share_path_ready && bundle_path_ready; then
+            break
         fi
 
-        if ! share_path_ready || ! bundle_path_ready; then
-            log WARN "Share or sparsebundle path is not reachable after refresh; skipping sparsebundle mount attempt \${attempt}/3"
-            sleep 5 || true
-            attempt=\$((attempt + 1))
-            continue
-        fi
-
-        if is_mountpoint "\$VOLUME_MOUNT_POINT"; then
-            log INFO "Sparsebundle already mounted at \$VOLUME_MOUNT_POINT"
-            return 0
-        fi
-
-        if bundle_is_attached; then
-            log INFO "Sparsebundle already attached for \$BUNDLE_PATH"
-            return 0
-        fi
-
-        if mount_sparsebundle_with_diskimagemounter || mount_sparsebundle_with_open || mount_sparsebundle_with_hdiutil; then
-            if wait_for_mountpoint "\$VOLUME_MOUNT_POINT" 45 || bundle_is_attached; then
-                return 0
-            fi
-        fi
-
-        log WARN "Sparsebundle mount attempt \${attempt}/3 did not complete; refreshing share before retry"
-        if network_host_reachable; then
-            request_share_mount || true
-        else
-            log WARN "Network host \$SHARE_HOST:\$SHARE_PORT is not reachable; skipping share refresh before retry"
-        fi
+        log WARN "Share refresh attempt \${attempt}/3 failed for \$DESTINATION"
         sleep 5 || true
         attempt=\$((attempt + 1))
     done
 
+    if ! share_path_ready || ! bundle_path_ready; then
+        log WARN "Share or sparsebundle path is not reachable; not requesting a sparsebundle mount"
+        return 1
+    fi
+
+    if is_mountpoint "\$VOLUME_MOUNT_POINT"; then
+        log INFO "Sparsebundle already mounted at \$VOLUME_MOUNT_POINT"
+        clear_gui_mount_cooldown
+        return 0
+    fi
+
+    if bundle_is_attached; then
+        log INFO "Sparsebundle already attached for \$BUNDLE_PATH"
+        clear_gui_mount_cooldown
+        return 0
+    fi
+
+    if ! gui_mount_allowed; then
+        return 1
+    fi
+
+    # Exactly one GUI mount request per run. `open` hands off to Launch Services
+    # and returns 0 immediately, so retrying does not replace a pending password
+    # dialog -- it stacks a second one behind it. The old loop did this up to
+    # three times per run, every LAUNCH_INTERVAL seconds.
+    if mount_sparsebundle_with_diskimagemounter || mount_sparsebundle_with_open || mount_sparsebundle_with_hdiutil; then
+        if wait_for_mountpoint "\$VOLUME_MOUNT_POINT" 45 || bundle_is_attached; then
+            clear_gui_mount_cooldown
+            return 0
+        fi
+
+        log WARN "Mount requested but not completed within 45s; assuming a password prompt is waiting for input"
+        begin_gui_mount_cooldown
+        return 1
+    fi
+
+    log WARN "All sparsebundle mount methods failed for \$BUNDLE_PATH"
     return 1
 }
 
@@ -1551,11 +1649,13 @@ log INFO "Bundle path verified at \$BUNDLE_PATH"
 
 if is_mountpoint "\$VOLUME_MOUNT_POINT"; then
     log INFO "Sparsebundle already mounted at \$VOLUME_MOUNT_POINT"
+    clear_gui_mount_cooldown
     exit 0
 fi
 
 if bundle_is_attached; then
     log INFO "Sparsebundle already attached for \$BUNDLE_PATH"
+    clear_gui_mount_cooldown
     exit 0
 fi
 

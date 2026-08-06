@@ -538,6 +538,8 @@ cleanup_logs() {
     remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.log" "remount helper log"
     remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-remount-monitor.log" "remount monitor log"
 
+    remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-gui-mount.state" "GUI mount cooldown state"
+
     if [[ -d "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock" ]]; then
         info "Removing stale remount lock: ${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
         run_or_echo run_as_root rm -rf "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"

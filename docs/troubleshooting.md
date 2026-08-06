@@ -30,6 +30,35 @@ Fix:
 bash bin/chronos-gn --launchagent-only --verbose
 ```
 
+## Symptom: password prompts for the sparsebundle pile up after going off-network
+
+This was a real bug through v2.2.1, fixed in 3.0.0. If you are still on the old build, this is the one you are hitting.
+
+Three things combined:
+
+1. When the link drops, macOS leaves the SMB mountpoint in `mount` output and answers `ls`/`stat` from cached metadata. The old `share_path_ready` only checked those, so a dead share looked healthy.
+2. `refresh_share_access` short-circuited on that healthy-looking state and returned success **before** reaching the `network_host_reachable` guard. The popup suppression added in 2.2.1 only covered the path where the checks fail, so a stale mount walked straight past it.
+3. The image itself was force-ejected when the link dropped, so the helper saw "share fine, bundle there, image not mounted" and asked DiskImageMounter to open a sparsebundle whose backing store was gone. macOS responds to that with the password dialog.
+
+The pile-up came from the retry loop. `open` hands off to Launch Services and returns 0 immediately, so the mount "succeeded" as far as the script knew; the 45-second wait then timed out against your unanswered dialog, and the loop tried again — up to three dialogs per run, every `LAUNCH_INTERVAL` seconds. Walk away for an hour on the default 300s interval and you come back to roughly three dozen.
+
+3.0.0 fixes all three:
+
+- `share_path_ready` requires host reachability, so a stale mount can no longer pass.
+- One GUI mount request per run, never a retry on top of a pending dialog.
+- If a request does not produce a mount within 45s, a cooldown (`GUI_MOUNT_COOLDOWN`, default 30 minutes) suppresses further requests, and `pgrep -x DiskImageMounter` blocks a new request while a dialog is on screen.
+
+Check it is working:
+
+```bash
+grep -E "cooldown|prompt is already open|not reachable" ~/Library/Logs/chronos-gn/chronos-gn-remount.log
+ls -la ~/Library/Logs/chronos-gn/chronos-gn-gui-mount.state
+```
+
+The state file holds the epoch seconds of the last unanswered prompt and is removed as soon as a mount succeeds. Deleting it manually ends the cooldown early.
+
+Separately: saving the sparsebundle password to Keychain stops most of these prompts appearing at all, because DiskImageMounter can then unlock without asking.
+
 ## Symptom: LaunchAgent is installed but remount does not happen
 
 Checks:
