@@ -1,33 +1,33 @@
-# Chronos Troubleshooting Guide
+# chronos-gn Troubleshooting Guide
 
 ## Fast triage
 
 ```bash
-cat /tmp/chronos.log
-ls -la ~/Library/Logs/Chronos
-cat ~/Library/Logs/Chronos/chronos-remount-monitor.log
-cat ~/Library/Logs/Chronos/chronos-remount.log
+cat ~/Library/Logs/chronos-gn/chronos-gn.log
+ls -la ~/Library/Logs/chronos-gn
+cat ~/Library/Logs/chronos-gn/chronos-gn-remount-monitor.log
+cat ~/Library/Logs/chronos-gn/chronos-gn-remount.log
 tmutil destinationinfo
-launchctl print gui/$(id -u)/com.$USER.chronos
+launchctl print gui/$(id -u)/io.github.andrewkc98.chronos-gn
 ```
 
 ## Symptom: Finder popup says there was a problem connecting to the server
 
 Likely cause: a GUI mount request was attempted while the network host was offline or unreachable.
 
-**v2.2.1 mitigation:** the remount helper checks host reachability with `nc` before calling GUI/Finder mount methods. If the host is unreachable, it logs a warning and skips GUI mount requests.
+**Built-in mitigation:** the remount helper checks host reachability with `nc` before calling GUI/Finder mount methods. If the host is unreachable, it logs a warning and skips GUI mount requests.
 
 Checks:
 
 ```bash
-nc -z -w 2 backup-server.example.local 445
-grep -i "not reachable" ~/Library/Logs/Chronos/chronos-remount.log
+nc -z -w 2 nas.example.com 445
+grep -i "not reachable" ~/Library/Logs/chronos-gn/chronos-gn-remount.log
 ```
 
 Fix:
 
 ```bash
-bash chronos_refactor.sh --launchagent-only --verbose
+bash bin/chronos-gn --launchagent-only --verbose
 ```
 
 ## Symptom: LaunchAgent is installed but remount does not happen
@@ -35,9 +35,9 @@ bash chronos_refactor.sh --launchagent-only --verbose
 Checks:
 
 ```bash
-launchctl print gui/$(id -u)/com.$USER.chronos
-cat ~/Library/Logs/Chronos/chronos-monitor.err
-cat ~/Library/Logs/Chronos/chronos-remount-monitor.log
+launchctl print gui/$(id -u)/io.github.andrewkc98.chronos-gn
+cat ~/Library/Logs/chronos-gn/chronos-gn-monitor.err
+cat ~/Library/Logs/chronos-gn/chronos-gn-remount-monitor.log
 ```
 
 Likely causes:
@@ -50,8 +50,8 @@ Likely causes:
 Fix:
 
 ```bash
-bash chronos_refactor.sh --launchagent-only --verbose
-launchctl kickstart -k gui/$(id -u)/com.$USER.chronos
+bash bin/chronos-gn --launchagent-only --verbose
+launchctl kickstart -k gui/$(id -u)/io.github.andrewkc98.chronos-gn
 ```
 
 ## Symptom: Sparsebundle exists but will not mount
@@ -78,7 +78,7 @@ Checks:
 ```bash
 tmutil destinationinfo
 mount | grep "Time Machine"
-cat /tmp/chronos.log | grep -i "destination"
+cat ~/Library/Logs/chronos-gn/chronos-gn.log | grep -i "destination"
 ```
 
 Manual remediation:
@@ -87,6 +87,26 @@ Manual remediation:
 sudo tmutil setdestination -a "/Volumes/Time Machine Backups"
 tmutil destinationinfo
 ```
+
+## Symptom: "unsupported configuration key" on startup
+
+The config parser allowlists keys and rejects anything else rather than silently ignoring a typo. Check the reported line against [configuration.md](configuration.md).
+
+Note that shell syntax does not work in a config file — it is parsed, not sourced. `SIZE=$MYSIZE` sets the literal string `$MYSIZE`, and `SIZE=$(cmd)` is not executed.
+
+## Symptom: "Refusing to use the default log path inside world-writable directory"
+
+The default log location resolved to something like `/tmp`, which is a symlink-attack surface for a script that escalates to root. This usually means the console user's home directory could not be resolved. Either fix that, or choose a log path deliberately with `--log-file /path/you/own/chronos-gn.log`.
+
+## Symptom: Two remount monitors running
+
+You have both a pre-3.0 `chronos` install and `chronos-gn`. Check:
+
+```bash
+ls ~/Library/LaunchAgents | grep -i chronos
+```
+
+See [migration-from-chronos.md](migration-from-chronos.md). Re-run `chronos-gn` and accept the migration prompt, or remove the old install by hand.
 
 ## Symptom: Script fails during sparsebundle copy
 
@@ -101,19 +121,20 @@ Checks:
 
 ```bash
 ls -la /Volumes/TimeMachine | grep partial
-cat /tmp/chronos.log | grep -i staging
+cat ~/Library/Logs/chronos-gn/chronos-gn.log | grep -i staging
 ```
 
 Controlled cleanup:
 
 ```bash
-bash chronos_refactor.sh --force-clean-partial --verbose
+bash bin/chronos-gn --force-clean-partial --verbose
 ```
 
 ## Common mistakes
 
 - Running everything as root and expecting GUI/Keychain behavior to work normally.
-- Publishing real server/share names in GitHub docs.
+- Publishing real server/share names when filing an issue.
 - Assuming encryption prevents accidental or malicious sparsebundle deletion.
 - Treating `mount` output as proof that a stale SMB share is usable.
-- Ignoring `~/Library/Logs/Chronos` and looking only at `/tmp/chronos.log`.
+- Reading only the setup log and ignoring the remount and monitor logs next to it — after the initial install, the interesting failures are all in those.
+- Editing the generated helper or monitor in `/usr/local/lib/chronos-gn` directly. Those files are regenerated; change the config or flags and re-run with `--launchagent-only`.

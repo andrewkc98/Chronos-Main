@@ -2,7 +2,6 @@
 ---
 
 Chronos - Time Machine Sparsebundle Automation
-Author: Andrew Tucker
 Target platform: Apple Inc. macOS (11 / Big Sur+)
 
 Overview
@@ -185,5 +184,4 @@ v2.1.0 - Restored Time Machine compatibility over SMB, replaced forced hdiutil a
 v2.2.0 - Replaced the unreliable timer-driven short-lived LaunchAgent with a persistent Aqua-session monitor, added the launchagent-only update mode, added helper locking to prevent overlap, and changed automatic sparsebundle remounts to prefer DiskImageMounter and Launch Services over Finder automation
 
 Contact
-Andrew Tucker
 

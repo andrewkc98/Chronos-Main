@@ -1,14 +1,14 @@
-# Chronos Architecture
+# chronos-gn Architecture
 
 ## Purpose
 
-Chronos automates macOS Time Machine setup for network-hosted sparsebundles while accounting for macOS-specific behavior around GUI sessions, SMB/AFP mounts, encrypted disk images, and `launchd`.
+chronos-gn automates macOS Time Machine setup for network-hosted sparsebundles while accounting for macOS-specific behavior around GUI sessions, SMB/AFP mounts, encrypted disk images, and `launchd`.
 
 ## Architecture overview
 
 ```mermaid
 flowchart TD
-    A[chronos_refactor.sh] --> B[Validate inputs and commands]
+    A[chronos-gn] --> B[Validate inputs and commands]
     B --> C[Discover console user and machine identity]
     C --> D[Mount SMB/AFP share]
     D --> E[Create or reuse sparsebundle]
@@ -25,14 +25,15 @@ flowchart TD
 
 ## Main script responsibilities
 
-- Parse CLI arguments.
-- Validate filesystem, URL, destination path, and launch interval.
+- Load the config file, then apply CLI arguments over it.
+- Validate filesystem, URL, destination path, launch interval, label prefix, and helper directory.
 - Discover the logged-in console user and machine identifiers.
 - Mount the network share.
 - Create or reuse a sparsebundle.
 - Write Time Machine machine metadata.
 - Mount the sparsebundle image.
 - Configure Time Machine with `tmutil setdestination -a`.
+- Detect and, with consent, migrate a pre-3.0 `chronos` install.
 - Install LaunchAgent, remount helper, and persistent monitor.
 - Optionally start the first backup.
 
@@ -50,23 +51,27 @@ flowchart TD
 | `HELPER_SCRIPT_PATH` | Generated remount helper path |
 | `MONITOR_SCRIPT_PATH` | Generated persistent monitor path |
 | `LAUNCH_AGENT_PATH` | Per-user LaunchAgent plist path |
+| `LABEL_PREFIX` | Reverse-DNS prefix; `LAUNCH_AGENT_LABEL` is `<prefix>.chronos-gn` |
+| `HELPER_DIR` | Install location for the generated helper and monitor |
+| `CONFIG_FILE` | Config file actually loaded, empty if none |
+| `BOOTSTRAP_LOG` | Temporary log buffer used before the final log path is known |
 
 ## Why console user context matters
 
-Chronos separates root-required tasks from GUI-session-sensitive tasks.
+chronos-gn separates root-required tasks from GUI-session-sensitive tasks.
 
 Root is useful for writing helper files, setting ownership, and configuring Time Machine. The logged-in console user context is needed for `open`, DiskImageMounter integration, Keychain prompts, and Aqua-session LaunchAgent behavior.
 
-## Remount architecture in v2.2.1
+## Remount architecture
 
-Chronos v2.2.1 uses a two-part remount model:
+chronos-gn uses a two-part remount model:
 
 1. **Persistent monitor**: long-running LaunchAgent process in the Aqua user session.
 2. **Remount helper**: short-lived helper called by the monitor to check and repair share/sparsebundle state.
 
 This design avoids relying solely on `StartInterval`, which was observed to be unreliable in this workflow.
 
-> **v2.1.1 vs v2.2.1:** The older v2.1.1 annotated script described a `StartInterval`-based flow using short-lived helper execution. That model is superseded. All documentation and the annotated script have been updated to reflect the v2.2.1 persistent monitor/remount-helper model.
+> The annotated script in `legacy/` describes an older `StartInterval`-based flow using short-lived helper execution. That model is superseded and the file is kept only as historical reference.
 
 ### Helper behavior
 
@@ -79,15 +84,27 @@ The helper:
 - attempts sparsebundle mount via DiskImageMounter, Launch Services `open`, and `hdiutil attach -agentpass`
 - logs final mount state
 
+## Configuration resolution
+
+Settings are resolved once, in this order, before any validation runs:
+
+1. Built-in defaults
+2. Config file — first match of `--config PATH`, `$CHRONOS_GN_CONFIG`, `${XDG_CONFIG_HOME:-$HOME/.config}/chronos-gn/config`, `/etc/chronos-gn/config`
+3. CLI flags
+
+`preload_config()` scans argv for `--config` before the main flag loop runs, so the file is applied first and flags always win. The file is parsed by a hand-rolled `KEY=value` reader with an allowlist rather than being sourced — it may be read under `sudo`, where sourcing would be arbitrary root code execution.
+
 ## Logging model
+
+The final log path depends on the console user's home directory, which is not known until `prepare_context()`. Logging therefore starts against an unpredictable `mktemp` buffer (`init_bootstrap_log`), and `finalize_log_file()` resolves the real path, creates the directory `0700`, and flushes the buffer into it. A log path that is a symlink is refused; a *default* log path inside a world-writable directory is refused unless `--log-file` was passed explicitly.
 
 | Log | Purpose |
 |---|---|
-| `/tmp/chronos.log` | Main setup script log |
-| `~/Library/Logs/Chronos/chronos-remount.log` | Remount helper log |
-| `~/Library/Logs/Chronos/chronos-remount-monitor.log` | Persistent monitor log |
-| `~/Library/Logs/Chronos/chronos-monitor.out` | LaunchAgent stdout |
-| `~/Library/Logs/Chronos/chronos-monitor.err` | LaunchAgent stderr |
+| `~/Library/Logs/chronos-gn/chronos-gn.log` | Main setup script log |
+| `~/Library/Logs/chronos-gn/chronos-gn-remount.log` | Remount helper log |
+| `~/Library/Logs/chronos-gn/chronos-gn-remount-monitor.log` | Persistent monitor log |
+| `~/Library/Logs/chronos-gn/chronos-gn-monitor.out` | LaunchAgent stdout |
+| `~/Library/Logs/chronos-gn/chronos-gn-monitor.err` | LaunchAgent stderr |
 
 ## Design tradeoffs
 
@@ -97,4 +114,7 @@ The helper:
 | Persistent monitor | More reliable reconnect behavior | Long-running user process |
 | Stage then promote sparsebundle copy | Safer partial-copy handling | More code and state tracking |
 | Encryption enabled by default | Protects backup contents | Requires Keychain/password handling |
+| Config file parsed, not sourced | A config file cannot become root code execution | No shell expansion; unknown keys are a hard error |
+| Log defaults into the user's home | No predictable path in a world-writable directory | Log location depends on runtime context, so logging starts buffered |
+| Migration removes legacy assets only after setup succeeds | A failed run leaves the working old install intact | Consent and execution are split across the run |
 | Idempotent reruns | Safer repeated execution | Requires more validation logic |

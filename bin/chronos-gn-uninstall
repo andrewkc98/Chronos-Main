@@ -1,0 +1,682 @@
+#!/bin/bash
+# =================================================================================================
+# chronos-gn-uninstall
+# Description: Removes chronos-gn LaunchAgent, helper assets, logs, and Time Machine destination
+#              entries. Never deletes the sparsebundle itself.
+# Usage: bash chronos-gn-uninstall [options]
+# -------------------------------------------------------------------------------------------------
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+readonly APP_NAME="chronos-gn"
+readonly VERSION="3.0.0"
+
+HELPER_DIR="/usr/local/lib/chronos-gn"
+LABEL_PREFIX="io.github.andrewkc98"
+VOLUME_NAME="Time Machine Backups"
+REMOVE_TM_DESTINATION=1
+REMOVE_HELPER_ASSETS=1
+REMOVE_LOGS=1
+DRY_RUN=0
+ASSUME_YES=0
+VERBOSE=0
+
+CONFIG_FILE=""
+LOG_FILE=""
+LOG_FILE_EXPLICIT=0
+BOOTSTRAP_LOG=""
+
+CONSOLE_USER=""
+CONSOLE_UID=""
+CONSOLE_GROUP=""
+CONSOLE_HOME=""
+LAUNCH_AGENT_LABEL=""
+LAUNCH_AGENT_PATH=""
+HELPER_SCRIPT_PATH=""
+MONITOR_SCRIPT_PATH=""
+LEGACY_APPLESCRIPT_PATH=""
+LAUNCH_LOG_DIR=""
+EXPECTED_MOUNT_POINT=""
+
+LEGACY_LAUNCH_AGENT_PATH=""
+LEGACY_HELPER_DIR="/usr/local/lib/chronos"
+LEGACY_LAUNCH_LOG_DIR=""
+
+usage() {
+    cat <<EOF
+${APP_NAME}-uninstall ${VERSION}
+
+Usage: ${SCRIPT_NAME} [options]
+
+Options:
+  -n, --name NAME            Time Machine backup volume name (default: Time Machine Backups)
+  -c, --config PATH          Read settings from a config file
+      --helper-dir PATH      Helper directory (default: ${HELPER_DIR})
+      --label-prefix PREFIX  Reverse-DNS prefix of the LaunchAgent label
+                             (default: ${LABEL_PREFIX})
+      --keep-tm-destination  Do not remove matching Time Machine destination entries
+      --keep-helper-assets   Do not remove generated helper files
+      --keep-logs            Do not remove ${APP_NAME} log files
+      --dry-run              Show planned actions without changing the system
+  -y, --yes                  Auto-confirm removal actions
+  -v, --verbose              Print INFO/WARN logs to stderr
+      --log-file PATH        Override log file path
+  -h, --help                 Show this help
+
+The sparsebundle itself is never deleted. Remove it manually once you are sure
+you no longer need the backup history it contains.
+EOF
+}
+
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+
+    if [[ -n "$LOG_FILE" ]]; then
+        printf '[%s] [%s] %s\n' "$(timestamp)" "$level" "$message" >>"$LOG_FILE"
+    fi
+
+    if [[ "$VERBOSE" -eq 1 || "$level" == "WARN" || "$level" == "ERROR" ]]; then
+        printf '[%s] [%s] %s\n' "$(timestamp)" "$level" "$message" >&2
+    fi
+}
+
+info() {
+    log "INFO" "$*"
+}
+
+warn() {
+    log "WARN" "$*"
+}
+
+error() {
+    log "ERROR" "$*"
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+run_as_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+run_or_echo() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        local rendered=""
+        printf -v rendered '%q ' "$@"
+        info "DRY RUN: ${rendered% }"
+        return 0
+    fi
+
+    "$@"
+}
+
+confirm_action() {
+    local prompt="$1"
+
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+        info "Auto-confirmed: ${prompt}"
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        return 1
+    fi
+
+    read -r -p "${prompt} [y/N]: " reply
+    [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# -----------------------------------------------
+# Logging bootstrap
+# -----------------------------------------------
+init_bootstrap_log() {
+    BOOTSTRAP_LOG="$(mktemp "/tmp/${APP_NAME}-uninstall-bootstrap.XXXXXX")"
+    chmod 0600 "$BOOTSTRAP_LOG"
+    LOG_FILE="$BOOTSTRAP_LOG"
+}
+
+dir_is_world_writable() {
+    local mode
+    mode="$(stat -f '%Lp' "$1" 2>/dev/null || true)"
+    [[ -n "$mode" ]] || return 1
+    (( (8#${mode} & 8#0002) != 0 ))
+}
+
+validate_log_path() {
+    local target="$1"
+    local dir
+
+    [[ "$target" = /* ]] || die "Log file path must be absolute: ${target}"
+    [[ ! -L "$target" ]] || die "Refusing to write the log through a symlink: ${target}"
+
+    dir="$(dirname "$target")"
+    if [[ "$LOG_FILE_EXPLICIT" -ne 1 && -d "$dir" ]] && dir_is_world_writable "$dir"; then
+        die "Refusing to use the default log path inside world-writable directory ${dir}. Pass --log-file to override."
+    fi
+}
+
+finalize_log_file() {
+    local target="$LOG_FILE"
+    local dir
+
+    if [[ "$LOG_FILE_EXPLICIT" -ne 1 ]]; then
+        if [[ -n "$CONSOLE_HOME" && -d "$CONSOLE_HOME" ]]; then
+            target="${CONSOLE_HOME}/Library/Logs/${APP_NAME}/${APP_NAME}-uninstall.log"
+        else
+            target="/var/log/${APP_NAME}/${APP_NAME}-uninstall.log"
+        fi
+    fi
+
+    validate_log_path "$target"
+    dir="$(dirname "$target")"
+
+    if [[ ! -d "$dir" ]]; then
+        if mkdir -p "$dir" 2>/dev/null; then
+            chmod 0700 "$dir" 2>/dev/null || true
+        else
+            run_as_root mkdir -p "$dir" || die "Unable to create log directory ${dir}."
+            if [[ -n "$CONSOLE_USER" && "$target" == "${CONSOLE_HOME}/"* ]]; then
+                run_as_root chown "$CONSOLE_USER:$CONSOLE_GROUP" "$dir" || true
+            fi
+        fi
+    fi
+
+    if ! : >"$target" 2>/dev/null; then
+        run_as_root install -m 0600 /dev/null "$target" || die "Unable to create log file ${target}."
+    fi
+
+    if [[ -n "$BOOTSTRAP_LOG" && -f "$BOOTSTRAP_LOG" ]]; then
+        cat "$BOOTSTRAP_LOG" >>"$target" || true
+        rm -f "$BOOTSTRAP_LOG" >/dev/null 2>&1 || true
+        BOOTSTRAP_LOG=""
+    fi
+
+    LOG_FILE="$target"
+}
+
+# -----------------------------------------------
+# Configuration file
+# -----------------------------------------------
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+strip_quotes() {
+    local value="$1"
+
+    if [[ "${#value}" -ge 2 ]]; then
+        if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+            printf '%s' "${value:1:${#value}-2}"
+            return 0
+        fi
+        if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            printf '%s' "${value:1:${#value}-2}"
+            return 0
+        fi
+    fi
+
+    printf '%s' "$value"
+}
+
+# Parsed, never sourced — see the same note in chronos-gn. Only the keys that
+# affect what gets removed are honored here; everything else in a shared config
+# file is ignored rather than rejected.
+load_config_file() {
+    local path="$1"
+    local line=""
+    local line_no=0
+    local key=""
+    local value=""
+
+    [[ -f "$path" ]] || die "Config file not found: ${path}"
+    [[ -r "$path" ]] || die "Config file is not readable: ${path}"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_no=$((line_no + 1))
+        line="${line%$'\r'}"
+        line="$(trim_whitespace "$line")"
+
+        [[ -n "$line" ]] || continue
+        [[ "${line:0:1}" != "#" ]] || continue
+        [[ "$line" == *=* ]] || die "${path}:${line_no}: expected KEY=value, got '${line}'."
+
+        key="$(trim_whitespace "${line%%=*}")"
+        value="$(strip_quotes "$(trim_whitespace "${line#*=}")")"
+
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "${path}:${line_no}: invalid configuration key '${key}'."
+
+        case "$key" in
+            HELPER_DIR) HELPER_DIR="$value" ;;
+            VOLUME_NAME) VOLUME_NAME="$value" ;;
+            LABEL_PREFIX) LABEL_PREFIX="$value" ;;
+            LOG_FILE)
+                LOG_FILE="$value"
+                LOG_FILE_EXPLICIT=1
+                ;;
+            *) ;;
+        esac
+    done <"$path"
+
+    CONFIG_FILE="$path"
+    info "Loaded configuration from ${path}."
+}
+
+resolve_config_file() {
+    local explicit="$1"
+    local candidate=""
+
+    if [[ -n "$explicit" ]]; then
+        load_config_file "$explicit"
+        return 0
+    fi
+
+    if [[ -n "${CHRONOS_GN_CONFIG:-}" ]]; then
+        load_config_file "$CHRONOS_GN_CONFIG"
+        return 0
+    fi
+
+    candidate="${XDG_CONFIG_HOME:-${HOME:-}/.config}/${APP_NAME}/config"
+    if [[ -f "$candidate" ]]; then
+        load_config_file "$candidate"
+        return 0
+    fi
+
+    candidate="/etc/${APP_NAME}/config"
+    if [[ -f "$candidate" ]]; then
+        load_config_file "$candidate"
+    fi
+
+    return 0
+}
+
+preload_config() {
+    local explicit=""
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -c|--config)
+                explicit="${2:?Missing value for $1}"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    resolve_config_file "$explicit"
+}
+
+parse_args() {
+    preload_config "$@"
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -n|--name)
+                VOLUME_NAME="${2:?Missing value for $1}"
+                shift 2
+                ;;
+            -c|--config)
+                # Already consumed by preload_config.
+                shift 2
+                ;;
+            --helper-dir)
+                HELPER_DIR="${2:?Missing value for $1}"
+                shift 2
+                ;;
+            --label-prefix)
+                LABEL_PREFIX="${2:?Missing value for $1}"
+                shift 2
+                ;;
+            --log-file)
+                LOG_FILE="${2:?Missing value for $1}"
+                LOG_FILE_EXPLICIT=1
+                shift 2
+                ;;
+            --keep-tm-destination)
+                REMOVE_TM_DESTINATION=0
+                shift
+                ;;
+            --keep-helper-assets)
+                REMOVE_HELPER_ASSETS=0
+                shift
+                ;;
+            --keep-logs)
+                REMOVE_LOGS=0
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                VERBOSE=1
+                shift
+                ;;
+            -y|--yes)
+                ASSUME_YES=1
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1"
+                ;;
+        esac
+    done
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+resolve_console_home() {
+    local home_dir=""
+
+    home_dir="$(dscl . -read "/Users/${CONSOLE_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+    if [[ -n "$home_dir" ]]; then
+        printf '%s\n' "$home_dir"
+        return 0
+    fi
+
+    home_dir="$(awk -F: -v user="$CONSOLE_USER" '$1 == user { print $6; exit }' /etc/passwd || true)"
+    if [[ -n "$home_dir" ]]; then
+        warn "Falling back to /etc/passwd to resolve home directory for ${CONSOLE_USER}."
+        printf '%s\n' "$home_dir"
+        return 0
+    fi
+
+    home_dir="$(eval "printf '%s\n' ~${CONSOLE_USER}" 2>/dev/null || true)"
+    if [[ -n "$home_dir" && "$home_dir" != "~${CONSOLE_USER}" ]]; then
+        warn "Falling back to shell expansion to resolve home directory for ${CONSOLE_USER}."
+        printf '%s\n' "$home_dir"
+        return 0
+    fi
+
+    return 1
+}
+
+prepare_context() {
+    CONSOLE_USER="$(stat -f '%Su' /dev/console)"
+    [[ -n "$CONSOLE_USER" && "$CONSOLE_USER" != "root" ]] || die "Unable to determine the logged-in console user."
+
+    CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+    CONSOLE_GROUP="$(id -gn "$CONSOLE_USER")"
+    CONSOLE_HOME="$(resolve_console_home || true)"
+    [[ -n "$CONSOLE_HOME" ]] || die "Unable to determine home directory for ${CONSOLE_USER}."
+
+    LAUNCH_AGENT_LABEL="${LABEL_PREFIX}.${APP_NAME}"
+    LAUNCH_AGENT_PATH="${CONSOLE_HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
+    HELPER_SCRIPT_PATH="${HELPER_DIR}/${APP_NAME}-remount.sh"
+    MONITOR_SCRIPT_PATH="${HELPER_DIR}/${APP_NAME}-remount-monitor.sh"
+    LEGACY_APPLESCRIPT_PATH="${HELPER_DIR}/chronos.scpt"
+    LAUNCH_LOG_DIR="${CONSOLE_HOME}/Library/Logs/${APP_NAME}"
+    EXPECTED_MOUNT_POINT="/Volumes/${VOLUME_NAME}"
+
+    LEGACY_LAUNCH_AGENT_PATH="${CONSOLE_HOME}/Library/LaunchAgents/com.${CONSOLE_USER}.chronos.plist"
+    LEGACY_LAUNCH_LOG_DIR="${CONSOLE_HOME}/Library/Logs/Chronos"
+}
+
+# Report-only: this uninstaller owns chronos-gn assets, not the pre-3.0 install.
+report_legacy_install() {
+    local found=0
+
+    [[ ! -f "$LEGACY_LAUNCH_AGENT_PATH" ]] || { warn "Legacy chronos LaunchAgent still present: ${LEGACY_LAUNCH_AGENT_PATH}"; found=1; }
+    [[ ! -d "$LEGACY_HELPER_DIR" || "$LEGACY_HELPER_DIR" == "$HELPER_DIR" ]] || { warn "Legacy chronos helper directory still present: ${LEGACY_HELPER_DIR}"; found=1; }
+    [[ ! -d "$LEGACY_LAUNCH_LOG_DIR" || "$LEGACY_LAUNCH_LOG_DIR" == "$LAUNCH_LOG_DIR" ]] || { warn "Legacy chronos log directory still present: ${LEGACY_LAUNCH_LOG_DIR}"; found=1; }
+
+    if [[ "$found" -eq 1 ]]; then
+        warn "Those belong to the pre-3.0 'chronos' install and are not removed by this uninstaller."
+    fi
+}
+
+validate_setup() {
+    require_command awk
+    require_command date
+    require_command dscl
+    require_command launchctl
+    require_command rm
+    require_command rmdir
+    require_command stat
+    require_command tmutil
+
+    [[ "$HELPER_DIR" = /* ]] || die "Helper directory must be an absolute path."
+    case "$HELPER_DIR" in
+        "/"|"/usr"|"/usr/local"|"/usr/local/lib"|"/etc"|"/var"|"/tmp")
+            die "Helper directory '${HELPER_DIR}' is too broad and is not allowed."
+            ;;
+    esac
+
+    [[ "$LABEL_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid label prefix '${LABEL_PREFIX}'."
+
+    if [[ "$LOG_FILE_EXPLICIT" -eq 1 ]]; then
+        validate_log_path "$LOG_FILE"
+    fi
+}
+
+cleanup_bootstrap_log() {
+    if [[ -n "${BOOTSTRAP_LOG:-}" && -f "${BOOTSTRAP_LOG}" ]]; then
+        rm -f "$BOOTSTRAP_LOG" >/dev/null 2>&1 || true
+    fi
+}
+
+trap cleanup_bootstrap_log EXIT
+
+launch_agent_loaded() {
+    launchctl print "gui/${CONSOLE_UID}/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1
+}
+
+unload_launchagent() {
+    info "Unloading LaunchAgent ${LAUNCH_AGENT_LABEL} if present."
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "DRY RUN: launchctl bootout gui/${CONSOLE_UID} ${LAUNCH_AGENT_PATH}"
+        return 0
+    fi
+
+    run_as_root launchctl bootout "gui/${CONSOLE_UID}" "$LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
+    run_as_root launchctl bootout "gui/${CONSOLE_UID}/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1 || true
+
+    if launch_agent_loaded; then
+        warn "LaunchAgent ${LAUNCH_AGENT_LABEL} still appears to be loaded."
+    else
+        info "LaunchAgent ${LAUNCH_AGENT_LABEL} is not loaded."
+    fi
+}
+
+remove_file_if_present() {
+    local path="$1"
+    local description="$2"
+
+    if [[ -e "$path" ]]; then
+        info "Removing ${description}: ${path}"
+        run_or_echo run_as_root rm -f "$path"
+    else
+        info "${description} not present: ${path}"
+    fi
+}
+
+cleanup_logs() {
+    if [[ "$REMOVE_LOGS" -ne 1 ]]; then
+        info "Skipping log cleanup."
+        return 0
+    fi
+
+    # The uninstaller's own log lives here too; removing it mid-run would lose the
+    # record of what this run did.
+    if [[ "${LAUNCH_LOG_DIR}/${APP_NAME}.log" != "$LOG_FILE" ]]; then
+        remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}.log" "setup log"
+    fi
+
+    remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-monitor.out" "LaunchAgent stdout log"
+    remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-monitor.err" "LaunchAgent stderr log"
+    remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.log" "remount helper log"
+    remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-remount-monitor.log" "remount monitor log"
+
+    if [[ -d "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock" ]]; then
+        info "Removing stale remount lock: ${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
+        run_or_echo run_as_root rm -rf "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
+    fi
+
+    if [[ -d "$LAUNCH_LOG_DIR" ]]; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            info "DRY RUN: remove log directory if empty: ${LAUNCH_LOG_DIR}"
+        else
+            rmdir "$LAUNCH_LOG_DIR" >/dev/null 2>&1 || info "Keeping log directory ${LAUNCH_LOG_DIR} because it is not empty."
+        fi
+    fi
+}
+
+cleanup_helper_dir() {
+    if [[ -d "$HELPER_DIR" ]]; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            info "DRY RUN: remove helper directory if empty: ${HELPER_DIR}"
+        else
+            run_as_root rmdir "$HELPER_DIR" >/dev/null 2>&1 || info "Keeping helper directory ${HELPER_DIR} because it is not empty."
+        fi
+    fi
+}
+
+remove_helper_assets() {
+    if [[ "$REMOVE_HELPER_ASSETS" -ne 1 ]]; then
+        info "Skipping helper asset removal."
+        return 0
+    fi
+
+    unload_launchagent
+    remove_file_if_present "$LAUNCH_AGENT_PATH" "LaunchAgent plist"
+    remove_file_if_present "$MONITOR_SCRIPT_PATH" "remount monitor"
+    remove_file_if_present "$HELPER_SCRIPT_PATH" "remount helper"
+    remove_file_if_present "$LEGACY_APPLESCRIPT_PATH" "legacy AppleScript"
+    cleanup_logs
+    cleanup_helper_dir
+}
+
+matching_destination_ids() {
+    tmutil destinationinfo 2>/dev/null | awk -v wanted_name="$VOLUME_NAME" -v wanted_mount="$EXPECTED_MOUNT_POINT" '
+        /^=+/ || /^> =+/ {
+            if (id != "" && (name == wanted_name || mount_point == wanted_mount)) {
+                print id
+            }
+            name=""
+            mount_point=""
+            id=""
+            next
+        }
+        /^Name[[:space:]]*:/ {
+            sub(/^[^:]*:[[:space:]]*/, "", $0)
+            name=$0
+            next
+        }
+        /^Mount Point[[:space:]]*:/ {
+            sub(/^[^:]*:[[:space:]]*/, "", $0)
+            mount_point=$0
+            next
+        }
+        /^ID[[:space:]]*:/ {
+            sub(/^[^:]*:[[:space:]]*/, "", $0)
+            id=$0
+            next
+        }
+        END {
+            if (id != "" && (name == wanted_name || mount_point == wanted_mount)) {
+                print id
+            }
+        }
+    '
+}
+
+remove_tm_destinations() {
+    if [[ "$REMOVE_TM_DESTINATION" -ne 1 ]]; then
+        info "Skipping Time Machine destination removal."
+        return 0
+    fi
+
+    local destination_ids=""
+    destination_ids="$(matching_destination_ids || true)"
+
+    if [[ -z "$destination_ids" ]]; then
+        info "No matching Time Machine destination found for ${VOLUME_NAME} (${EXPECTED_MOUNT_POINT})."
+        return 0
+    fi
+
+    info "Matching Time Machine destination IDs:"
+    while IFS= read -r destination_id; do
+        [[ -n "$destination_id" ]] || continue
+        info "  ${destination_id}"
+    done <<<"$destination_ids"
+
+    if [[ "$ASSUME_YES" -ne 1 ]] && ! confirm_action "Remove matching Time Machine destination entries?"; then
+        warn "Skipping Time Machine destination removal by user choice."
+        return 0
+    fi
+
+    while IFS= read -r destination_id; do
+        [[ -n "$destination_id" ]] || continue
+        info "Removing Time Machine destination ${destination_id}"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            info "DRY RUN: tmutil removedestination ${destination_id}"
+        else
+            run_as_root tmutil removedestination "$destination_id"
+        fi
+    done <<<"$destination_ids"
+}
+
+print_summary() {
+    cat <<EOF
+Summary
+-------
+LaunchAgent label : ${LAUNCH_AGENT_LABEL}
+LaunchAgent path  : ${LAUNCH_AGENT_PATH}
+Helper dir        : ${HELPER_DIR}
+Volume name       : ${VOLUME_NAME}
+Expected mount    : ${EXPECTED_MOUNT_POINT}
+Dry run           : ${DRY_RUN}
+Config file       : ${CONFIG_FILE:-none}
+Log file          : ${LOG_FILE}
+EOF
+}
+
+main() {
+    init_bootstrap_log
+    parse_args "$@"
+
+    info "${APP_NAME}-uninstall ${VERSION} starting."
+    validate_setup
+    prepare_context
+    finalize_log_file
+    print_summary
+
+    remove_tm_destinations
+    remove_helper_assets
+    report_legacy_install
+
+    info "${APP_NAME}-uninstall completed. The sparsebundle was not removed."
+}
+
+main "$@"

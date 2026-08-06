@@ -1,7 +1,6 @@
 #!/bin/bash
 # =================================================================================================
 # Chronos Refactor 2.2.1 - Annotated Review Copy
-# Author: Andrew Tucker
 # Description: Automated Time Machine Setup including sparsebundle creation, configuration, and autoconnection
 # Usage: bash chronos_refactor.sh [-h HELP]
 # -------------------------------------------------------------------------------------------------

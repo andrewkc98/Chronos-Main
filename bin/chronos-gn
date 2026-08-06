@@ -1,16 +1,19 @@
 #!/bin/bash
 # =================================================================================================
-# Chronos Refactor 2.2.1
-# Author: Andrew Tucker
-# Description: Automated Time Machine Setup including sparsebundle creation, configuration, and autoconnection
-# Usage: bash chronos_refactor.sh [-h HELP]
+# chronos-gn
+# Description: Automated macOS Time Machine setup including sparsebundle creation, configuration,
+#              and persistent reconnection to a network-hosted backup share.
+# Usage: bash chronos-gn --url smb://host/share [options]
 # -------------------------------------------------------------------------------------------------
 
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="2.2.1"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+readonly APP_NAME="chronos-gn"
+readonly VERSION="3.0.0"
+readonly LEGACY_PASSWORD_ENV_VAR="CHRONOS_ENCRYPTION_PASSWORD"
 
 # -----------------------------------------------
 # Script Metadata & Defaults
@@ -23,16 +26,24 @@ LAUNCHAGENT_ONLY=0
 START_FIRST_BACKUP=1
 ENABLE_ENCRYPTION=1
 FORCE_CLEAN_PARTIAL=0
+MIGRATE_LEGACY=1
+MIGRATION_APPROVED=0
 LAUNCH_INTERVAL=300
 SIZE="2000g"
 FILESYSTEM="APFS"
 DESTINATION="/Volumes/TimeMachine"
-NETWORK_URL="smb://server.local/TimeMachine"
+NETWORK_URL=""
 VOLUME_NAME="Time Machine Backups"
-HELPER_DIR="/usr/local/lib/chronos"
-LOG_FILE="/tmp/chronos.log"
-PASSWORD_ENV_VAR="CHRONOS_ENCRYPTION_PASSWORD"
+LABEL_PREFIX="io.github.andrewkc98"
+HELPER_DIR="/usr/local/lib/chronos-gn"
+PASSWORD_ENV_VAR="CHRONOS_GN_ENCRYPTION_PASSWORD"
 ENCRYPTION_PASSWORD=""
+
+CONFIG_FILE=""
+LEGACY_PASSWORD_WARNED=0
+LOG_FILE=""
+LOG_FILE_EXPLICIT=0
+BOOTSTRAP_LOG=""
 
 CONSOLE_USER=""
 CONSOLE_UID=""
@@ -57,29 +68,42 @@ SHARE_PORT=""
 IMAGE_DEVICE=""
 IMAGE_MOUNT_POINT=""
 EXPECTED_IMAGE_MOUNT_POINT=""
-EXISTING_IMAGE_MOUNT=0
 MOUNTED_IMAGE_IN_RUN=0
-TEMP_BUNDLE_CREATED=0
 RUN_SUCCEEDED=0
 SUMMARY_BACKUP_STATUS="not-requested"
 SUMMARY_LAUNCHAGENT_STATUS="not-requested"
 SUMMARY_BUNDLE_STATUS="unknown"
+SUMMARY_MIGRATION_STATUS="not-needed"
+
+LEGACY_LAUNCH_AGENT_LABEL=""
+LEGACY_LAUNCH_AGENT_PATH=""
+LEGACY_HELPER_DIR="/usr/local/lib/chronos"
+LEGACY_LAUNCH_LOG_DIR=""
 
 # -----------------------------------------------
 # Usage
 # -----------------------------------------------
 usage() {
-    cat <<'EOF'
-Usage: chronos_refactor.sh [options]
+    cat <<EOF
+${APP_NAME} ${VERSION}
+
+Usage: ${SCRIPT_NAME} --url smb://host/share [options]
 
 Core options:
-  -s, --size SIZE                 Sparsebundle size, e.g. 2000g
-  -d, --destination PATH          Mounted network share path, e.g. /Volumes/TimeMachine
+  -u, --url URL                   smb:// or afp:// URL used to mount the share (required)
+  -s, --size SIZE                 Sparsebundle size, e.g. 2000g (default: 2000g)
+  -d, --destination PATH          Mounted network share path (default: /Volumes/TimeMachine)
   -f, --filesystem FS             APFS, Case-sensitive APFS, Journaled HFS+, or Case-sensitive Journaled HFS+
-  -u, --url URL                   smb:// or afp:// URL used to mount the share
   -n, --name NAME                 Backup volume name inside the sparsebundle
       --no-encryption             Create the sparsebundle without AES-256 encryption
       --password-env VAR          Environment variable containing the encryption password
+
+Configuration:
+  -c, --config PATH               Read settings from a config file
+      --label-prefix PREFIX       Reverse-DNS prefix for the LaunchAgent label
+                                  (default: ${LABEL_PREFIX})
+      --helper-dir PATH           Directory for generated helper scripts
+                                  (default: ${HELPER_DIR})
 
 Behavior:
       --no-launchagent            Skip LaunchAgent helper setup
@@ -87,14 +111,22 @@ Behavior:
       --launch-interval SECONDS   Remount recheck interval for the persistent monitor (default: 300)
       --no-start-backup           Skip starting the first backup
       --force-clean-partial       Remove known partial bundles without prompting
-  -y, --yes                       Auto-confirm destructive cleanup prompts
+      --no-migrate                Do not migrate a legacy 'chronos' install if one is found
+  -y, --yes                       Auto-confirm destructive cleanup and migration prompts
   -v, --verbose                   Print INFO/WARN logs to stdout
       --debug                     Enable debug logging
       --log-file PATH             Override log file path
   -h, --help                      Show this help
 
+Configuration file search order (first match wins, CLI flags always win over it):
+  --config PATH
+  \$CHRONOS_GN_CONFIG
+  \${XDG_CONFIG_HOME:-\$HOME/.config}/${APP_NAME}/config
+  /etc/${APP_NAME}/config
+
 Environment:
-  CHRONOS_ENCRYPTION_PASSWORD     Password used when encryption is enabled
+  CHRONOS_GN_ENCRYPTION_PASSWORD  Password used when encryption is enabled
+  CHRONOS_GN_CONFIG               Path to a configuration file
 EOF
 }
 # -----------------------------------------------
@@ -112,7 +144,11 @@ log() {
     local level="$1"
     shift
     local message="$*"
-    printf '[%s] [%s] %s\n' "$(timestamp)" "$level" "$message" >>"$LOG_FILE"
+
+    # LOG_FILE is empty only in the narrow window before init_bootstrap_log runs.
+    if [[ -n "$LOG_FILE" ]]; then
+        printf '[%s] [%s] %s\n' "$(timestamp)" "$level" "$message" >>"$LOG_FILE"
+    fi
 
     if [[ "$DEBUG" -eq 1 || "$VERBOSE" -eq 1 || "$level" == "ERROR" || "$level" == "WARN" ]]; then
         printf '[%s] [%s] %s\n' "$(timestamp)" "$level" "$message" >&2
@@ -171,9 +207,20 @@ cleanup() {
     unset ENCRYPTION_PASSWORD || true
 
     if [[ "$exit_code" -eq 0 ]]; then
-        info "Chronos completed successfully."
+        info "${APP_NAME} completed successfully."
     else
-        error "Chronos exited with failure status ${exit_code}."
+        error "${APP_NAME} exited with failure status ${exit_code}."
+    fi
+
+    # Anything still buffered means we exited before finalize_log_file, i.e. during
+    # argument or environment validation. Those errors already went to stderr, so
+    # the buffer is only worth keeping when debugging.
+    if [[ -n "${BOOTSTRAP_LOG:-}" && -f "${BOOTSTRAP_LOG}" ]]; then
+        if [[ "$exit_code" -ne 0 && "$DEBUG" -eq 1 ]]; then
+            printf 'Early-run log retained at %s\n' "$BOOTSTRAP_LOG" >&2
+        else
+            rm -f "$BOOTSTRAP_LOG" >/dev/null 2>&1 || true
+        fi
     fi
 }
 
@@ -250,7 +297,253 @@ confirm_action() {
     [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
+# -----------------------------------------------
+# Logging bootstrap
+# -----------------------------------------------
+# The real log location depends on the console user's home directory, which is
+# only known after prepare_context(). Until then everything is buffered into an
+# unpredictable mktemp file, which is then flushed into the final log.
+init_bootstrap_log() {
+    BOOTSTRAP_LOG="$(mktemp "/tmp/${APP_NAME}-bootstrap.XXXXXX")"
+    chmod 0600 "$BOOTSTRAP_LOG"
+    LOG_FILE="$BOOTSTRAP_LOG"
+}
+
+dir_is_world_writable() {
+    local dir="$1"
+    local mode
+
+    mode="$(stat -f '%Lp' "$dir" 2>/dev/null || true)"
+    [[ -n "$mode" ]] || return 1
+    (( (8#${mode} & 8#0002) != 0 ))
+}
+
+validate_log_path() {
+    local target="$1"
+    local dir
+
+    [[ "$target" = /* ]] || die "Log file path must be absolute: ${target}"
+    [[ ! -L "$target" ]] || die "Refusing to write the log through a symlink: ${target}"
+
+    dir="$(dirname "$target")"
+
+    # A predictable log path inside a world-writable directory is a symlink-swap
+    # target for any local user, and this script runs privileged steps.
+    if [[ "$LOG_FILE_EXPLICIT" -ne 1 && -d "$dir" ]] && dir_is_world_writable "$dir"; then
+        die "Refusing to use the default log path inside world-writable directory ${dir}. Pass --log-file to override."
+    fi
+}
+
+finalize_log_file() {
+    local target="$LOG_FILE"
+    local dir
+
+    if [[ "$LOG_FILE_EXPLICIT" -ne 1 ]]; then
+        if [[ -n "$CONSOLE_HOME" && -d "$CONSOLE_HOME" ]]; then
+            target="${CONSOLE_HOME}/Library/Logs/${APP_NAME}/${APP_NAME}.log"
+        else
+            target="/var/log/${APP_NAME}/${APP_NAME}.log"
+        fi
+    fi
+
+    validate_log_path "$target"
+    dir="$(dirname "$target")"
+
+    # Try unprivileged first: the default lives in the console user's own home,
+    # and escalating there would only leave root-owned files behind.
+    if [[ ! -d "$dir" ]]; then
+        if mkdir -p "$dir" 2>/dev/null; then
+            chmod 0700 "$dir" 2>/dev/null || true
+        else
+            run_as_root mkdir -p "$dir" || die "Unable to create log directory ${dir}."
+            run_as_root chmod 0700 "$dir" || warn "Unable to set permissions on log directory ${dir}."
+            if [[ -n "$CONSOLE_USER" && "$target" == "${CONSOLE_HOME}/"* ]]; then
+                run_as_root chown "$CONSOLE_USER:$CONSOLE_GROUP" "$dir" || warn "Unable to set ownership on log directory ${dir}."
+            fi
+        fi
+    fi
+
+    if ! : >"$target" 2>/dev/null; then
+        run_as_root install -m 0600 /dev/null "$target" || die "Unable to create log file ${target}."
+        if [[ "$target" == "${CONSOLE_HOME}/"* && -n "$CONSOLE_USER" ]]; then
+            run_as_root chown "$CONSOLE_USER:$CONSOLE_GROUP" "$target" || true
+        fi
+    fi
+
+    if [[ -n "$BOOTSTRAP_LOG" && -f "$BOOTSTRAP_LOG" ]]; then
+        cat "$BOOTSTRAP_LOG" >>"$target" || true
+        rm -f "$BOOTSTRAP_LOG" >/dev/null 2>&1 || true
+        BOOTSTRAP_LOG=""
+    fi
+
+    LOG_FILE="$target"
+    info "Logging to ${LOG_FILE}."
+}
+
+# -----------------------------------------------
+# Configuration file
+# -----------------------------------------------
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+strip_quotes() {
+    local value="$1"
+
+    if [[ "${#value}" -ge 2 ]]; then
+        if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+            printf '%s' "${value:1:${#value}-2}"
+            return 0
+        fi
+        if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            printf '%s' "${value:1:${#value}-2}"
+            return 0
+        fi
+    fi
+
+    printf '%s' "$value"
+}
+
+parse_bool() {
+    local value="$1"
+    local context="$2"
+
+    case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) printf '1' ;;
+        0|false|no|off) printf '0' ;;
+        *) die "Invalid boolean value '${value}' for ${context}. Use true/false." ;;
+    esac
+}
+
+apply_config_value() {
+    local key="$1"
+    local value="$2"
+    local origin="$3"
+
+    case "$key" in
+        NETWORK_URL) NETWORK_URL="$value" ;;
+        DESTINATION) DESTINATION="$value" ;;
+        SIZE) SIZE="$value" ;;
+        FILESYSTEM) FILESYSTEM="$value" ;;
+        VOLUME_NAME) VOLUME_NAME="$value" ;;
+        HELPER_DIR) HELPER_DIR="$value" ;;
+        LABEL_PREFIX) LABEL_PREFIX="$value" ;;
+        LAUNCH_INTERVAL) LAUNCH_INTERVAL="$value" ;;
+        PASSWORD_ENV_VAR) PASSWORD_ENV_VAR="$value" ;;
+        ENABLE_ENCRYPTION) ENABLE_ENCRYPTION="$(parse_bool "$value" "ENABLE_ENCRYPTION in ${origin}")" ;;
+        START_FIRST_BACKUP) START_FIRST_BACKUP="$(parse_bool "$value" "START_FIRST_BACKUP in ${origin}")" ;;
+        LOG_FILE)
+            LOG_FILE="$value"
+            LOG_FILE_EXPLICIT=1
+            ;;
+        ENCRYPTION_PASSWORD)
+            die "${origin}: ENCRYPTION_PASSWORD must not be stored in a config file. Use PASSWORD_ENV_VAR or the interactive prompt."
+            ;;
+        *)
+            die "${origin}: unsupported configuration key '${key}'."
+            ;;
+    esac
+}
+
+# Deliberately a hand-rolled parser rather than `source`: this file may be read
+# while running under sudo, and sourcing it would make it arbitrary root code.
+load_config_file() {
+    local path="$1"
+    local line=""
+    local line_no=0
+    local key=""
+    local value=""
+    local mode=""
+
+    [[ -f "$path" ]] || die "Config file not found: ${path}"
+    [[ -r "$path" ]] || die "Config file is not readable: ${path}"
+
+    mode="$(stat -f '%Lp' "$path" 2>/dev/null || true)"
+    if [[ -n "$mode" ]] && (( (8#${mode} & 8#0022) != 0 )); then
+        warn "Config file ${path} is group- or world-writable; tighten it with chmod 600."
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_no=$((line_no + 1))
+        line="${line%$'\r'}"
+        line="$(trim_whitespace "$line")"
+
+        [[ -n "$line" ]] || continue
+        [[ "${line:0:1}" != "#" ]] || continue
+
+        [[ "$line" == *=* ]] || die "${path}:${line_no}: expected KEY=value, got '${line}'."
+
+        key="$(trim_whitespace "${line%%=*}")"
+        value="$(trim_whitespace "${line#*=}")"
+        value="$(strip_quotes "$value")"
+
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "${path}:${line_no}: invalid configuration key '${key}'."
+
+        apply_config_value "$key" "$value" "${path}:${line_no}"
+    done <"$path"
+
+    CONFIG_FILE="$path"
+    info "Loaded configuration from ${path}."
+}
+
+resolve_config_file() {
+    local explicit="$1"
+    local candidate=""
+
+    if [[ -n "$explicit" ]]; then
+        load_config_file "$explicit"
+        return 0
+    fi
+
+    if [[ -n "${CHRONOS_GN_CONFIG:-}" ]]; then
+        load_config_file "$CHRONOS_GN_CONFIG"
+        return 0
+    fi
+
+    candidate="${XDG_CONFIG_HOME:-${HOME:-}/.config}/${APP_NAME}/config"
+    if [[ -n "${HOME:-}" || -n "${XDG_CONFIG_HOME:-}" ]] && [[ -f "$candidate" ]]; then
+        load_config_file "$candidate"
+        return 0
+    fi
+
+    candidate="/etc/${APP_NAME}/config"
+    if [[ -f "$candidate" ]]; then
+        load_config_file "$candidate"
+        return 0
+    fi
+
+    return 0
+}
+
+# Config values are applied before the flag loop so that CLI flags always win.
+preload_config() {
+    local explicit=""
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -c|--config)
+                explicit="${2:?Missing value for $1}"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    resolve_config_file "$explicit"
+}
+
 parse_args() {
+    preload_config "$@"
+
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
             -s|--size)
@@ -280,6 +573,22 @@ parse_args() {
             --password-env)
                 PASSWORD_ENV_VAR="${2:?Missing value for $1}"
                 shift 2
+                ;;
+            -c|--config)
+                # Already consumed by preload_config.
+                shift 2
+                ;;
+            --label-prefix)
+                LABEL_PREFIX="${2:?Missing value for $1}"
+                shift 2
+                ;;
+            --helper-dir)
+                HELPER_DIR="${2:?Missing value for $1}"
+                shift 2
+                ;;
+            --no-migrate)
+                MIGRATE_LEGACY=0
+                shift
                 ;;
             --no-launchagent)
                 SETUP_LAUNCHAGENT=0
@@ -317,6 +626,7 @@ parse_args() {
                 ;;
             --log-file)
                 LOG_FILE="${2:?Missing value for $1}"
+                LOG_FILE_EXPLICIT=1
                 shift 2
                 ;;
             -h|--help)
@@ -362,7 +672,25 @@ validate_launch_interval() {
     [[ "$LAUNCH_INTERVAL" =~ ^[1-9][0-9]*$ ]] || die "Launch interval must be a positive integer."
 }
 
+validate_label_prefix() {
+    [[ "$LABEL_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid label prefix '${LABEL_PREFIX}'. Use reverse-DNS form, e.g. io.github.yourname."
+    [[ "$LABEL_PREFIX" != *".." ]] || die "Invalid label prefix '${LABEL_PREFIX}'."
+}
+
+validate_helper_dir() {
+    [[ "$HELPER_DIR" = /* ]] || die "Helper directory must be an absolute path."
+    case "$HELPER_DIR" in
+        "/"|"/usr"|"/usr/local"|"/usr/local/lib"|"/etc"|"/var"|"/tmp")
+            die "Helper directory '${HELPER_DIR}' is too broad and is not allowed."
+            ;;
+    esac
+}
+
 validate_url() {
+    if [[ -z "$NETWORK_URL" ]]; then
+        die "A network share URL is required. Set it with --url smb://host/share, with NETWORK_URL in a config file, or via CHRONOS_GN_CONFIG."
+    fi
+
     [[ "$NETWORK_URL" =~ ^(smb|afp)://[^/]+/.+ ]] || die "Network URL must look like smb://host/share or afp://host/share."
 
     SHARE_HOST="$(printf '%s' "$NETWORK_URL" | sed -E 's#^[a-z]+://([^/@]+@)?([^/]+)/.*#\2#')"
@@ -401,14 +729,18 @@ prepare_context() {
     BUNDLE_PATH="${DESTINATION}/${BUNDLE_NAME}"
     MACHINE_ID_PLIST="${BUNDLE_PATH}/com.apple.TimeMachine.MachineID.plist"
     STAGING_BUNDLE="${DESTINATION}/.${BUNDLE_NAME}.partial"
-    LAUNCH_AGENT_LABEL="com.${CONSOLE_USER}.chronos"
+    LAUNCH_AGENT_LABEL="${LABEL_PREFIX}.${APP_NAME}"
     LAUNCH_AGENT_PATH="${CONSOLE_HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
-    HELPER_SCRIPT_PATH="${HELPER_DIR}/chronos-remount.sh"
-    MONITOR_SCRIPT_PATH="${HELPER_DIR}/chronos-remount-monitor.sh"
-    LAUNCH_LOG_DIR="${CONSOLE_HOME}/Library/Logs/Chronos"
+    HELPER_SCRIPT_PATH="${HELPER_DIR}/${APP_NAME}-remount.sh"
+    MONITOR_SCRIPT_PATH="${HELPER_DIR}/${APP_NAME}-remount-monitor.sh"
+    LAUNCH_LOG_DIR="${CONSOLE_HOME}/Library/Logs/${APP_NAME}"
     EXPECTED_IMAGE_MOUNT_POINT="/Volumes/${VOLUME_NAME}"
 
-    TMP_DIR="$(mktemp -d /tmp/chronos.XXXXXX)"
+    LEGACY_LAUNCH_AGENT_LABEL="com.${CONSOLE_USER}.chronos"
+    LEGACY_LAUNCH_AGENT_PATH="${CONSOLE_HOME}/Library/LaunchAgents/${LEGACY_LAUNCH_AGENT_LABEL}.plist"
+    LEGACY_LAUNCH_LOG_DIR="${CONSOLE_HOME}/Library/Logs/Chronos"
+
+    TMP_DIR="$(mktemp -d "/tmp/${APP_NAME}.XXXXXX")"
     TMP_BUNDLE="${TMP_DIR}/${BUNDLE_NAME}"
 }
 
@@ -437,12 +769,16 @@ validate_setup() {
     validate_destination
     validate_url
     validate_launch_interval
+    validate_label_prefix
+    validate_helper_dir
 
     if [[ "$LAUNCHAGENT_ONLY" -eq 1 && "$SETUP_LAUNCHAGENT" -ne 1 ]]; then
         die "--launchagent-only cannot be combined with --no-launchagent."
     fi
 
-    [[ -w "$(dirname "$LOG_FILE")" ]] || die "Log directory is not writable: $(dirname "$LOG_FILE")"
+    if [[ "$LOG_FILE_EXPLICIT" -eq 1 ]]; then
+        validate_log_path "$LOG_FILE"
+    fi
 }
 # -----------------------------------------------
 # Network Mount
@@ -475,8 +811,23 @@ mount_network_share() {
     info "Network share mounted at ${DESTINATION}."
 }
 
+# Accepts the pre-3.0 variable name so existing automation keeps working.
+password_from_env() {
+    local value="${!PASSWORD_ENV_VAR:-}"
+
+    if [[ -z "$value" && "$PASSWORD_ENV_VAR" != "$LEGACY_PASSWORD_ENV_VAR" ]]; then
+        value="${!LEGACY_PASSWORD_ENV_VAR:-}"
+        if [[ -n "$value" && "$LEGACY_PASSWORD_WARNED" -eq 0 ]]; then
+            LEGACY_PASSWORD_WARNED=1
+            warn "Using deprecated ${LEGACY_PASSWORD_ENV_VAR}; rename it to ${PASSWORD_ENV_VAR}."
+        fi
+    fi
+
+    printf '%s' "$value"
+}
+
 get_encryption_password() {
-    local password="${ENCRYPTION_PASSWORD:-${!PASSWORD_ENV_VAR:-}}"
+    local password="${ENCRYPTION_PASSWORD:-$(password_from_env)}"
 
     if [[ -n "$password" ]]; then
         ENCRYPTION_PASSWORD="$password"
@@ -507,7 +858,7 @@ validate_local_sparsebundle_image() {
     local image_path="$1"
 
     if [[ "$ENABLE_ENCRYPTION" -eq 1 ]]; then
-        local validation_password="${ENCRYPTION_PASSWORD:-${!PASSWORD_ENV_VAR:-}}"
+        local validation_password="${ENCRYPTION_PASSWORD:-$(password_from_env)}"
 
         if [[ -n "$validation_password" ]]; then
             printf '%s' "$validation_password" | hdiutil imageinfo -stdinpass "$image_path" >/dev/null 2>&1
@@ -623,12 +974,10 @@ create_sparsebundle() {
 
     [[ -d "$TMP_BUNDLE" ]] || die "Sparsebundle creation reported success but ${TMP_BUNDLE} was not created."
     validate_local_sparsebundle_image "$TMP_BUNDLE" || die "New sparsebundle ${TMP_BUNDLE} is invalid."
-    TEMP_BUNDLE_CREATED=1
 
     copy_bundle_to_share
 
     rm -rf "$TMP_BUNDLE"
-    TEMP_BUNDLE_CREATED=0
     SUMMARY_BUNDLE_STATUS="created-new"
 }
 
@@ -729,7 +1078,6 @@ mount_sparsebundle_once() {
     if is_mountpoint "$EXPECTED_IMAGE_MOUNT_POINT"; then
         IMAGE_MOUNT_POINT="$EXPECTED_IMAGE_MOUNT_POINT"
         IMAGE_DEVICE="$(device_for_mount_point "$IMAGE_MOUNT_POINT" || true)"
-        EXISTING_IMAGE_MOUNT=1
         info "Sparsebundle already mounted at ${IMAGE_MOUNT_POINT}."
         return 0
     fi
@@ -739,7 +1087,6 @@ mount_sparsebundle_once() {
     if [[ -n "$existing_mount" ]]; then
         IMAGE_MOUNT_POINT="$existing_mount"
         IMAGE_DEVICE="$(device_for_mount_point "$IMAGE_MOUNT_POINT" || true)"
-        EXISTING_IMAGE_MOUNT=1
         if [[ "$existing_mount" != "$EXPECTED_IMAGE_MOUNT_POINT" ]]; then
             warn "Sparsebundle is already mounted at ${existing_mount} instead of ${EXPECTED_IMAGE_MOUNT_POINT}."
         else
@@ -819,11 +1166,101 @@ configure_tm() {
 write_file_atomically() {
     local target="$1"
     local mode="$2"
-    local temp_file="${TMP_DIR}/$(basename "$target").tmp"
+    local temp_file
+    temp_file="${TMP_DIR}/$(basename "$target").tmp"
 
     cat >"$temp_file"
     run_as_root install -m "$mode" "$temp_file" "$target"
 }
+# -----------------------------------------------
+# Legacy 'chronos' migration
+# -----------------------------------------------
+legacy_install_present() {
+    [[ -f "$LEGACY_LAUNCH_AGENT_PATH" || -d "$LEGACY_HELPER_DIR" || -d "$LEGACY_LAUNCH_LOG_DIR" ]]
+}
+
+# Deliberately touches only the LaunchAgent, helper assets, and logs. The
+# sparsebundle and the Time Machine destination are left exactly as they are:
+# configure_tm() re-registers the same mounted volume, so backup history carries
+# over untouched.
+# Detection and consent happen early so the user is not asked halfway through a
+# long sparsebundle creation; the removal itself runs later, once the new install
+# is known to be working.
+check_legacy_install() {
+    if ! legacy_install_present; then
+        return 0
+    fi
+
+    if [[ "$MIGRATE_LEGACY" -ne 1 ]]; then
+        SUMMARY_MIGRATION_STATUS="skipped-by-flag"
+        warn "A legacy 'chronos' install was detected but --no-migrate was set; both remount monitors may run at once."
+        return 0
+    fi
+
+    local found=()
+    [[ ! -f "$LEGACY_LAUNCH_AGENT_PATH" ]] || found+=("LaunchAgent ${LEGACY_LAUNCH_AGENT_PATH}")
+    [[ ! -d "$LEGACY_HELPER_DIR" ]] || found+=("helper directory ${LEGACY_HELPER_DIR}")
+    [[ ! -d "$LEGACY_LAUNCH_LOG_DIR" ]] || found+=("log directory ${LEGACY_LAUNCH_LOG_DIR}")
+
+    warn "Detected a legacy 'chronos' install:"
+    local item
+    for item in "${found[@]}"; do
+        warn "  - ${item}"
+    done
+    warn "Leaving it in place would run two remount monitors against the same sparsebundle."
+
+    if ! confirm_action "Remove the legacy chronos LaunchAgent and helper assets? (the sparsebundle and Time Machine destination are not touched)"; then
+        SUMMARY_MIGRATION_STATUS="declined"
+        die "Legacy chronos install left in place. Re-run with --yes to migrate, or --no-migrate to proceed without migrating."
+    fi
+
+    MIGRATION_APPROVED=1
+    info "Legacy chronos migration approved; it will run once the new install is ready."
+}
+
+migrate_legacy_install() {
+    if [[ "$MIGRATION_APPROVED" -ne 1 ]]; then
+        return 0
+    fi
+
+    if ! legacy_install_present; then
+        SUMMARY_MIGRATION_STATUS="not-needed"
+        return 0
+    fi
+
+    if [[ -f "$LEGACY_LAUNCH_AGENT_PATH" ]]; then
+        if run_as_root launchctl bootout "gui/${CONSOLE_UID}" "$LEGACY_LAUNCH_AGENT_PATH" >/dev/null 2>&1; then
+            info "Booted out legacy LaunchAgent ${LEGACY_LAUNCH_AGENT_LABEL}."
+        else
+            info "Legacy LaunchAgent ${LEGACY_LAUNCH_AGENT_LABEL} was not loaded."
+        fi
+
+        run_as_root rm -f "$LEGACY_LAUNCH_AGENT_PATH" || warn "Unable to remove ${LEGACY_LAUNCH_AGENT_PATH}."
+        info "Removed legacy LaunchAgent plist."
+    fi
+
+    if [[ -d "$LEGACY_HELPER_DIR" && "$LEGACY_HELPER_DIR" != "$HELPER_DIR" ]]; then
+        run_as_root rm -rf "$LEGACY_HELPER_DIR" || warn "Unable to remove ${LEGACY_HELPER_DIR}."
+        info "Removed legacy helper directory ${LEGACY_HELPER_DIR}."
+    fi
+
+    # Old logs are archived rather than deleted; they are the only record of how
+    # the previous install was behaving.
+    if [[ -d "$LEGACY_LAUNCH_LOG_DIR" && "$LEGACY_LAUNCH_LOG_DIR" != "$LAUNCH_LOG_DIR" ]]; then
+        local archive_dir="${LAUNCH_LOG_DIR}/legacy-chronos"
+        run_as_root mkdir -p "$LAUNCH_LOG_DIR"
+        if run_as_root mv "$LEGACY_LAUNCH_LOG_DIR" "$archive_dir"; then
+            run_as_root chown -R "$CONSOLE_USER:$CONSOLE_GROUP" "$archive_dir" || true
+            info "Archived legacy logs to ${archive_dir}."
+        else
+            warn "Unable to archive legacy logs from ${LEGACY_LAUNCH_LOG_DIR}."
+        fi
+    fi
+
+    SUMMARY_MIGRATION_STATUS="migrated"
+    info "Legacy chronos install migrated."
+}
+
 # -----------------------------------------------
 #Launchagent
 # -----------------------------------------------
@@ -849,8 +1286,8 @@ setup_launchagent() {
 set -euo pipefail
 IFS=\$'\\n\\t'
 
-LOG_FILE="${LAUNCH_LOG_DIR}/chronos-remount.log"
-LOCK_DIR="${LAUNCH_LOG_DIR}/chronos-remount.lock"
+LOG_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-remount.log"
+LOCK_DIR="${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
 DISK_IMAGE_MOUNTER_APP="/System/Library/CoreServices/DiskImageMounter.app"
 NETWORK_URL="${NETWORK_URL}"
 SHARE_HOST="${SHARE_HOST}"
@@ -1097,7 +1534,7 @@ attempt_sparsebundle_mount() {
     return 1
 }
 
-log INFO "Chronos remount check started"
+log INFO "${APP_NAME} remount check started"
 
 if ! share_path_ready || ! bundle_path_ready; then
     if refresh_share_access; then
@@ -1142,7 +1579,7 @@ EOF
 set -euo pipefail
 IFS=\$'\\n\\t'
 
-LOG_FILE="${LAUNCH_LOG_DIR}/chronos-remount-monitor.log"
+LOG_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-remount-monitor.log"
 HELPER_SCRIPT="${HELPER_SCRIPT_PATH}"
 CHECK_INTERVAL="${LAUNCH_INTERVAL}"
 HELPER_TIMEOUT_SECONDS="${LAUNCH_INTERVAL}"
@@ -1195,7 +1632,7 @@ run_helper_once() {
 }
 
 handle_shutdown() {
-    log INFO "Chronos remount monitor stopping"
+    log INFO "${APP_NAME} remount monitor stopping"
     exit 0
 }
 
@@ -1208,11 +1645,11 @@ trap handle_shutdown INT TERM HUP
 # mount logic in the same user context after login and through later reconnects.
 # Sleep can return early after wake or signal delivery; that must not terminate
 # the persistent monitor loop in a long-running user session.
-log INFO "Chronos remount monitor started with interval \${CHECK_INTERVAL}s"
+log INFO "${APP_NAME} remount monitor started with interval \${CHECK_INTERVAL}s"
 
 while true; do
     run_helper_once || true
-    log INFO "Chronos remount monitor sleeping for \${CHECK_INTERVAL}s"
+    log INFO "${APP_NAME} remount monitor sleeping for \${CHECK_INTERVAL}s"
     sleep "\$CHECK_INTERVAL" || true
 done
 EOF
@@ -1240,9 +1677,9 @@ EOF
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>${LAUNCH_LOG_DIR}/chronos-monitor.out</string>
+    <string>${LAUNCH_LOG_DIR}/${APP_NAME}-monitor.out</string>
     <key>StandardErrorPath</key>
-    <string>${LAUNCH_LOG_DIR}/chronos-monitor.err</string>
+    <string>${LAUNCH_LOG_DIR}/${APP_NAME}-monitor.err</string>
 </dict>
 </plist>
 EOF
@@ -1306,8 +1743,10 @@ Summary
 Sparsebundle path : ${BUNDLE_PATH}
 Sparsebundle mode : ${SUMMARY_BUNDLE_STATUS}
 Mounted at        : ${IMAGE_MOUNT_POINT}
-LaunchAgent       : ${SUMMARY_LAUNCHAGENT_STATUS}
+LaunchAgent       : ${SUMMARY_LAUNCHAGENT_STATUS} (${LAUNCH_AGENT_LABEL})
+Legacy migration  : ${SUMMARY_MIGRATION_STATUS}
 Backup start      : ${SUMMARY_BACKUP_STATUS}
+Config file       : ${CONFIG_FILE:-none}
 Log file          : ${LOG_FILE}
 EOF
 
@@ -1319,13 +1758,13 @@ EOF
 # Main
 # -----------------------------------------------
 main() {
+    init_bootstrap_log
     parse_args "$@"
-    [[ -d "$(dirname "$LOG_FILE")" && -w "$(dirname "$LOG_FILE")" ]] || die "Log directory is not writable: $(dirname "$LOG_FILE")"
-    : >"$LOG_FILE"
 
-    info "Chronos ${VERSION} starting."
+    info "${APP_NAME} ${VERSION} starting."
     validate_setup
     prepare_context
+    finalize_log_file
 
     info "Console user: ${CONSOLE_USER}"
     info "Computer name: ${COMPUTER_NAME}"
@@ -1333,6 +1772,8 @@ main() {
     info "Destination mount: ${DESTINATION}"
     info "Filesystem: ${FILESYSTEM}"
     info "Encryption enabled: ${ENABLE_ENCRYPTION}"
+
+    check_legacy_install
 
     if [[ "$LAUNCHAGENT_ONLY" -eq 1 ]]; then
         SUMMARY_BUNDLE_STATUS="unchanged"
@@ -1346,6 +1787,7 @@ main() {
         configure_tm
     fi
 
+    migrate_legacy_install
     setup_launchagent
 
     if [[ "$LAUNCHAGENT_ONLY" -ne 1 ]]; then

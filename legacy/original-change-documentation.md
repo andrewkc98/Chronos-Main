@@ -1,6 +1,5 @@
 > This is the original change documentation walkthrough comparing Chronos 1.5 to the v2.0+ refactor.
 > Retained as a reference for understanding the architectural reasoning behind the refactor.
-> Author: Andrew Tucker
 ---
 
 How to read this walkthrough

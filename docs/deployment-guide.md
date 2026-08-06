@@ -1,8 +1,8 @@
-# Chronos Deployment Guide
+# chronos-gn Deployment Guide
 
 ## Purpose
 
-Deploy Chronos on a macOS device that should back up to a Time Machine sparsebundle stored on a network share.
+Deploy chronos-gn on a macOS device that should back up to a Time Machine sparsebundle stored on a network share.
 
 ## Prerequisites
 
@@ -20,13 +20,15 @@ Deploy Chronos on a macOS device that should back up to a Time Machine sparsebun
 3. Decide sparsebundle size, filesystem, and volume name.
 4. Decide whether encryption should be enabled. Default is enabled.
 5. Confirm NAS/server-side deletion protection, snapshots, or recycle-bin behavior.
-6. Confirm whether the first encrypted image password should be saved in Keychain.
+6. Confirm whether the first encrypted image password should be saved in Keychain. Unattended remounts need it there.
+7. Decide whether to use a config file rather than flags. See [configuration.md](configuration.md).
+8. If a pre-3.0 `chronos` install exists on this machine, read [migration-from-chronos.md](migration-from-chronos.md) first.
 
 ## Example deployment command
 
 ```bash
-bash chronos_refactor.sh \
-  --url "smb://backup-server.example.local/TimeMachine" \
+bash bin/chronos-gn \
+  --url "smb://nas.example.com/TimeMachine" \
   --destination "/Volumes/TimeMachine" \
   --size 2000g \
   --filesystem APFS \
@@ -34,10 +36,22 @@ bash chronos_refactor.sh \
   --verbose
 ```
 
+## Config-file deployment
+
+For repeat deployments, put the settings in a file instead:
+
+```bash
+mkdir -p ~/.config/chronos-gn
+cp examples/chronos-gn.conf.example ~/.config/chronos-gn/config
+chmod 600 ~/.config/chronos-gn/config
+$EDITOR ~/.config/chronos-gn/config
+bash bin/chronos-gn --verbose
+```
+
 ## LaunchAgent-only update
 
 ```bash
-bash chronos_refactor.sh --launchagent-only --verbose
+bash bin/chronos-gn --launchagent-only --verbose
 ```
 
 This mode updates the helper, monitor, LaunchAgent plist, and launchctl state while skipping sparsebundle and Time Machine destination changes.
@@ -45,13 +59,13 @@ This mode updates the helper, monitor, LaunchAgent plist, and launchctl state wh
 ## Verification steps
 
 ```bash
-cat /tmp/chronos.log
+cat ~/Library/Logs/chronos-gn/chronos-gn.log
 tmutil destinationinfo
 mount | grep "Time Machine Backups"
-launchctl print gui/$(id -u)/com.$USER.chronos
-ls -la ~/Library/Logs/Chronos
-cat ~/Library/Logs/Chronos/chronos-remount-monitor.log
-cat ~/Library/Logs/Chronos/chronos-remount.log
+launchctl print gui/$(id -u)/io.github.andrewkc98.chronos-gn
+ls -la ~/Library/Logs/chronos-gn
+cat ~/Library/Logs/chronos-gn/chronos-gn-remount-monitor.log
+cat ~/Library/Logs/chronos-gn/chronos-gn-remount.log
 ```
 
 ## Operational test
@@ -65,16 +79,17 @@ cat ~/Library/Logs/Chronos/chronos-remount.log
 7. Confirm no repeating Finder popup appears while offline.
 8. Reconnect to the network.
 9. Confirm the monitor eventually restores access.
+10. Confirm a restore actually works. A backup you have never restored from is a hypothesis, not a backup.
 
 ## Rollback
 
 ```bash
-bash chronos_uninstall.sh --dry-run --verbose
-bash chronos_uninstall.sh --verbose
+bash bin/chronos-gn-uninstall --dry-run --verbose
+bash bin/chronos-gn-uninstall --verbose
 ```
 
 Preserve Time Machine destination:
 
 ```bash
-bash chronos_uninstall.sh --keep-tm-destination --verbose
+bash bin/chronos-gn-uninstall --keep-tm-destination --verbose
 ```

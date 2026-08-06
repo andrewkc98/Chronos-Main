@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint and smoke test
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Syntax check
+        run: |
+          bash -n bin/chronos-gn
+          bash -n bin/chronos-gn-uninstall
+
+      - name: ShellCheck
+        run: shellcheck -S warning bin/chronos-gn bin/chronos-gn-uninstall tests/*.sh
+
+      # The remount helper, monitor, and LaunchAgent plist are written from
+      # heredocs at install time. A syntax error in one of them would otherwise
+      # only surface on a real install.
+      - name: Generated assets are valid
+        run: bash tests/check-generated-assets.sh
+
+      # Everything below needs no network share and no GUI session. The real
+      # end-to-end path needs both, so it stays a documented manual test.
+      - name: Help exits cleanly
+        run: |
+          bash bin/chronos-gn --help >/dev/null
+          bash bin/chronos-gn-uninstall --help >/dev/null
+
+      - name: Missing --url is rejected
+        run: |
+          if bash bin/chronos-gn >/dev/null 2>&1; then
+            echo "expected failure when --url is omitted" >&2
+            exit 1
+          fi
+          bash bin/chronos-gn 2>&1 | grep -q "network share URL is required"
+
+      - name: Invalid arguments are rejected
+        run: |
+          set +e
+          for args in \
+            "--url smb://nas.example.com/TM --size bogus" \
+            "--url smb://nas.example.com/TM --filesystem ZFS" \
+            "--url smb://nas.example.com/TM --launch-interval -1" \
+            "--url not-a-url" \
+            "--url smb://nas.example.com/TM --destination relative/path" \
+            "--url smb://nas.example.com/TM --destination /Volumes" \
+            "--url smb://nas.example.com/TM --label-prefix 'bad prefix'" \
+            "--url smb://nas.example.com/TM --helper-dir /usr/local/lib"
+          do
+            # shellcheck disable=SC2086
+            bash bin/chronos-gn $args >/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+              echo "expected failure for: $args" >&2
+              exit 1
+            fi
+          done
+
+      - name: Config file is accepted
+        run: |
+          printf 'NETWORK_URL=smb://nas.example.com/TimeMachine\nSIZE=100g\n' > /tmp/ci.conf
+          chmod 600 /tmp/ci.conf
+          bash bin/chronos-gn --config /tmp/ci.conf --help >/dev/null
+
+      - name: Example config parses
+        run: bash bin/chronos-gn --config examples/chronos-gn.conf.example --help >/dev/null
+
+      - name: Unknown config key is rejected
+        run: |
+          printf 'NETWORK_URL=smb://nas.example.com/TM\nBOGUS_KEY=1\n' > /tmp/bad.conf
+          if bash bin/chronos-gn --config /tmp/bad.conf >/dev/null 2>&1; then
+            echo "expected failure for unknown config key" >&2
+            exit 1
+          fi
+          bash bin/chronos-gn --config /tmp/bad.conf 2>&1 | grep -q "unsupported configuration key"
+
+      - name: Config file cannot execute code or carry a password
+        run: |
+          printf 'NETWORK_URL=smb://nas.example.com/TM\nSIZE=$(touch /tmp/pwned)g\n' > /tmp/inject.conf
+          bash bin/chronos-gn --config /tmp/inject.conf >/dev/null 2>&1 || true
+          if [ -e /tmp/pwned ]; then
+            echo "config file achieved command execution" >&2
+            exit 1
+          fi
+          printf 'ENCRYPTION_PASSWORD=hunter2\n' > /tmp/pw.conf
+          bash bin/chronos-gn --config /tmp/pw.conf 2>&1 | grep -q "must not be stored in a config file"
+
+      - name: CLI flags override the config file
+        run: |
+          printf 'NETWORK_URL=smb://nas.example.com/TM\nSIZE=100g\n' > /tmp/override.conf
+          bash bin/chronos-gn --config /tmp/override.conf --size bogus 2>&1 | grep -q "Invalid size 'bogus'"

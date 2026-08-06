@@ -1,0 +1,75 @@
+# chronos-gn configuration
+#
+# Copy this file to one of the locations chronos-gn searches, in order:
+#
+#   $CHRONOS_GN_CONFIG
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/chronos-gn/config
+#   /etc/chronos-gn/config
+#
+# ...or point at it explicitly with --config PATH.
+#
+# Command-line flags always override values set here.
+#
+# Format: KEY=value, one per line. Blank lines and lines starting with # are
+# ignored. Values may be quoted; surrounding single or double quotes are
+# stripped. Unknown keys are a hard error, so a typo fails loudly instead of
+# being silently ignored.
+#
+# This file is parsed, not sourced. Shell expansion, command substitution, and
+# variable references do NOT work here — write literal values only.
+#
+# Recommended permissions: chmod 600
+
+# --- Required -------------------------------------------------------------
+
+# smb:// or afp:// URL of the share that will hold the sparsebundle.
+NETWORK_URL=smb://nas.example.com/TimeMachine
+
+# --- Share and sparsebundle ----------------------------------------------
+
+# Where the network share gets mounted locally.
+# DESTINATION=/Volumes/TimeMachine
+
+# Maximum sparsebundle size. Sparse, so this is a ceiling, not an allocation.
+# Accepts b, k, m, g, t, p, e suffixes.
+# SIZE=2000g
+
+# APFS, Case-sensitive APFS, Journaled HFS+, or Case-sensitive Journaled HFS+
+# FILESYSTEM=APFS
+
+# Volume name inside the sparsebundle. This also determines the mount point,
+# /Volumes/<VOLUME_NAME>.
+# VOLUME_NAME=Time Machine Backups
+
+# --- Encryption -----------------------------------------------------------
+
+# AES-256 encryption for the sparsebundle. Enabled by default.
+# Accepts true/false, yes/no, on/off, 1/0.
+# ENABLE_ENCRYPTION=true
+
+# Name of the environment variable holding the encryption password.
+# The password itself must NEVER appear in this file — chronos-gn rejects an
+# ENCRYPTION_PASSWORD key here on purpose.
+# PASSWORD_ENV_VAR=CHRONOS_GN_ENCRYPTION_PASSWORD
+
+# --- Install locations ----------------------------------------------------
+
+# Reverse-DNS prefix for the LaunchAgent label. The full label becomes
+# <LABEL_PREFIX>.chronos-gn. Change this if you fork or run multiple installs.
+# LABEL_PREFIX=io.github.andrewkc98
+
+# Directory for the generated remount helper and monitor scripts.
+# HELPER_DIR=/usr/local/lib/chronos-gn
+
+# Main setup log. Defaults to ~/Library/Logs/chronos-gn/chronos-gn.log.
+# Setting this counts as an explicit override and relaxes the world-writable
+# directory check, so choose a directory only you can write to.
+# LOG_FILE=/Users/you/Library/Logs/chronos-gn/chronos-gn.log
+
+# --- Behavior -------------------------------------------------------------
+
+# Seconds between remount checks by the persistent monitor.
+# LAUNCH_INTERVAL=300
+
+# Start a first backup once setup succeeds.
+# START_FIRST_BACKUP=true

@@ -1,45 +1,59 @@
-# Chronos Uninstall Guide
+# chronos-gn Uninstall Guide
 
 ## Dry run first
 
 ```bash
-bash chronos_uninstall.sh --dry-run --verbose
+bash bin/chronos-gn-uninstall --dry-run --verbose
 ```
 
 ## Standard uninstall
 
 ```bash
-bash chronos_uninstall.sh --verbose
+bash bin/chronos-gn-uninstall --verbose
 ```
 
-Default behavior removes matching Time Machine destination entries, helper assets, LaunchAgent plist, and Chronos logs.
+Default behavior removes matching Time Machine destination entries, helper assets, LaunchAgent plist, and chronos-gn logs.
 
 ## Preserve Time Machine destination
 
 ```bash
-bash chronos_uninstall.sh --keep-tm-destination --verbose
+bash bin/chronos-gn-uninstall --keep-tm-destination --verbose
 ```
 
 ## Preserve helper assets
 
 ```bash
-bash chronos_uninstall.sh --keep-helper-assets --verbose
+bash bin/chronos-gn-uninstall --keep-helper-assets --verbose
 ```
 
 ## Preserve logs
 
 ```bash
-bash chronos_uninstall.sh --keep-logs --verbose
+bash bin/chronos-gn-uninstall --keep-logs --verbose
 ```
+
+## Non-default install locations
+
+If you installed with a custom `--label-prefix` or `--helper-dir`, pass the same values to the uninstaller, or point both at the same config file:
+
+```bash
+bash bin/chronos-gn-uninstall --config ~/.config/chronos-gn/config --dry-run --verbose
+```
+
+Without them the uninstaller looks for the defaults, reports nothing present, and leaves your install untouched.
+
+## Legacy chronos assets
+
+The uninstaller removes `chronos-gn` assets only. If it finds a pre-3.0 `chronos` install it reports it and leaves it alone; see [migration-from-chronos.md](migration-from-chronos.md) for removing that.
 
 ## Verification
 
 ```bash
-launchctl print gui/$(id -u)/com.$USER.chronos
+launchctl print gui/$(id -u)/io.github.andrewkc98.chronos-gn
 ls -la ~/Library/LaunchAgents | grep chronos
-ls -la /usr/local/lib/chronos
+ls -la /usr/local/lib/chronos-gn
 tmutil destinationinfo
-ls -la ~/Library/Logs/Chronos
+ls -la ~/Library/Logs/chronos-gn
 ```
 
 > The uninstall process does not delete the sparsebundle itself. Deleting a sparsebundle is destructive and should be handled separately with a confirmed backup retention decision.

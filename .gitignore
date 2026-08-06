@@ -1,4 +1,18 @@
-*.log
+# macOS
 .DS_Store
-chronos.log
+._*
+.Spotlight-V100
+.Trashes
+
+# Logs and scratch
+*.log
 *.tmp
+chronos-gn-bootstrap.*
+
+# Never commit a real config or a backup image
+chronos-gn.conf
+config
+*.sparsebundle
+
+# Local tool settings
+.claude/settings.local.json
