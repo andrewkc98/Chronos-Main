@@ -47,6 +47,7 @@ substitute() {
         -e 's|${LAUNCH_AGENT_LABEL}|io.github.example.chronos-gn|g' \
         -e 's|${LAUNCH_INTERVAL}|300|g' \
         -e 's|${GUI_MOUNT_COOLDOWN}|1800|g' \
+        -e 's|${BACKUP_ALERT_DAYS}|7|g' \
         "$1"
 }
 

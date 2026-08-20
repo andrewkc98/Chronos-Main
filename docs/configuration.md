@@ -44,6 +44,7 @@ See [`examples/chronos-gn.conf.example`](../examples/chronos-gn.conf.example) fo
 | `LOG_FILE` | `--log-file` | `~/Library/Logs/chronos-gn/chronos-gn.log` | Main setup log |
 | `LAUNCH_INTERVAL` | `--launch-interval` | `300` | Seconds between remount checks |
 | `GUI_MOUNT_COOLDOWN` | `--gui-mount-cooldown` | `1800` | After an unanswered disk image password prompt, seconds to wait before asking again. `0` disables the cooldown. |
+| `BACKUP_ALERT_DAYS` | `--backup-alert-days` | `7` | Alert when the newest Time Machine backup is older than this many days. `0` disables the check. |
 | `START_FIRST_BACKUP` | `--no-start-backup` | `true` | Start a backup after setup |
 
 ## Flags with no config equivalent
@@ -81,5 +82,7 @@ Prefer the interactive prompt for the password. Use the environment variable onl
 **`SIZE`** — a sparsebundle only consumes what it uses, but Time Machine treats this as the disk size and will prune backups against it. Sizing it near your share quota is normal; sizing it larger than the share can hold means Time Machine will not prune until the share itself fills.
 
 **`GUI_MOUNT_COOLDOWN`** — this exists because an unanswered password dialog is invisible to every state check the remount helper makes: the volume is not mounted and the image is not attached, so without a cooldown each pass concludes "mount it" and stacks another dialog behind the first. Lower it if you want faster recovery after dismissing a prompt; raise it if you are often away from the machine. Setting it to `0` restores the pre-3.0 behavior, which is not recommended.
+
+**`BACKUP_ALERT_DAYS`** — the persistent monitor checks `tmutil latestbackup` at most once an hour and compares its date against this threshold. When the newest backup is older than `BACKUP_ALERT_DAYS`, it logs an ERROR and posts a macOS user notification, so a share that silently stopped accepting backups (permissions changed, quota hit, share unmounted for good) does not go unnoticed for weeks. Both the log line and the notification are throttled to once per 24h. Setting it to `0` disables the check entirely.
 
 **`VOLUME_NAME`** — two machines can share one `VOLUME_NAME` safely; the sparsebundle name is derived from computer name plus MAC address, so each machine gets its own image. But the mount point `/Volumes/<VOLUME_NAME>` is per-machine, so this only matters locally.

@@ -48,6 +48,18 @@ $EDITOR ~/.config/chronos-gn/config
 bash bin/chronos-gn --verbose
 ```
 
+## Unattended / automated re-runs
+
+A run that gets interrupted after the sparsebundle copy to the share has started (network drop, script killed, machine slept) leaves a partial bundle staged at `<destination>/.<bundle-name>.partial`. By design, the next run stops and asks before touching it — an unattended retry that silently deleted or overwrote a partial copy could just as easily be deleting an in-progress legitimate copy from a different run.
+
+For automation (CI, MDM post-install scripts, scheduled retries) that needs to proceed without a human at the prompt, pass `--force-clean-partial` (or `-y`, which also auto-confirms the legacy-migration prompt) so a leftover `.partial` bundle is removed without asking:
+
+```bash
+bash bin/chronos-gn --url "smb://nas.example.com/TimeMachine" --force-clean-partial --verbose
+```
+
+Without one of these flags, a non-interactive re-run (no TTY on stdin) fails closed rather than guessing — `confirm_action` returns false when it cannot prompt, so the run aborts with the partial-bundle error instead of proceeding either way.
+
 ## LaunchAgent-only update
 
 ```bash

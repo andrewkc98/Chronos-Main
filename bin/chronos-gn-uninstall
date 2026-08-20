@@ -521,6 +521,27 @@ remove_file_if_present() {
     fi
 }
 
+# Removing a remount helper's lock directory out from under it while it is
+# still running lets a second helper invocation acquire the lock too, and the
+# original still holds files open under the now-deleted directory. Give a live
+# helper up to 30s to finish and release the lock on its own before we take it.
+wait_for_helper_lock_release() {
+    local lock_dir="$1"
+    local pid=""
+    local waited=0
+
+    pid="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+
+    info "Waiting up to 30s for a running remount helper (pid ${pid}) to finish"
+    while [[ "$waited" -lt 30 ]]; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 1 || true
+        waited=$((waited + 1))
+    done
+}
+
 cleanup_logs() {
     if [[ "$REMOVE_LOGS" -ne 1 ]]; then
         info "Skipping log cleanup."
@@ -541,6 +562,10 @@ cleanup_logs() {
     remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-gui-mount.state" "GUI mount cooldown state"
 
     if [[ -d "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock" ]]; then
+        if [[ "$DRY_RUN" -ne 1 ]]; then
+            wait_for_helper_lock_release "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
+        fi
+
         info "Removing stale remount lock: ${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
         run_or_echo run_as_root rm -rf "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
     fi
