@@ -185,7 +185,16 @@ else
 fi
 
 # A live remount helper must be waited out before its lock directory is taken.
-lock_wait_result="$(
+# Defined as a function rather than inlined: bash 3.2, which macOS ships as
+# /bin/bash, mis-parses $(( )) nested inside a command substitution.
+lock_wait_elapsed() {
+    local name="$1"
+    local pid_contents="$2"
+    local lock="${WORK_DIR}/lock-${name}"
+
+    mkdir -p "$lock"
+    printf '%s\n' "$pid_contents" >"${lock}/pid"
+
     (
         # shellcheck disable=SC1090
         source "$LIB" >/dev/null 2>&1
@@ -194,33 +203,36 @@ lock_wait_result="$(
         # shellcheck disable=SC2034
         VERBOSE=0
         LOG_FILE=""
-
-        lock="${WORK_DIR}/lock-dead"
-        mkdir -p "$lock"
-        echo "999999" >"${lock}/pid"
-        start=$SECONDS
+        local started=$SECONDS
         wait_for_helper_lock_release "$lock"
-        [[ $((SECONDS - start)) -le 1 ]] && echo "dead-ok"
-
-        lock="${WORK_DIR}/lock-garbage"
-        mkdir -p "$lock"
-        echo "not-a-pid" >"${lock}/pid"
-        start=$SECONDS
-        wait_for_helper_lock_release "$lock"
-        [[ $((SECONDS - start)) -le 1 ]] && echo "garbage-ok"
-
-        lock="${WORK_DIR}/lock-live"
-        mkdir -p "$lock"
-        sleep 2 &
-        echo "$!" >"${lock}/pid"
-        start=$SECONDS
-        wait_for_helper_lock_release "$lock"
-        [[ $((SECONDS - start)) -ge 1 ]] && echo "live-ok"
+        echo $(( SECONDS - started ))
     ) 2>/dev/null
-)"
-assert_contains "$lock_wait_result" "dead-ok" "lock wait returns at once for a dead helper pid"
-assert_contains "$lock_wait_result" "garbage-ok" "lock wait returns at once for a garbage pid file"
-assert_contains "$lock_wait_result" "live-ok" "lock wait blocks while a helper is still running"
+}
+
+elapsed="$(lock_wait_elapsed dead 999999)"
+if [[ "$elapsed" -le 1 ]]; then
+    ok "lock wait returns at once for a dead helper pid"
+else
+    fail "lock wait blocked ${elapsed}s on a dead helper pid"
+fi
+
+elapsed="$(lock_wait_elapsed garbage not-a-pid)"
+if [[ "$elapsed" -le 1 ]]; then
+    ok "lock wait returns at once for a garbage pid file"
+else
+    fail "lock wait blocked ${elapsed}s on a garbage pid file"
+fi
+
+sleep 2 &
+live_pid=$!
+elapsed="$(lock_wait_elapsed live "$live_pid")"
+if [[ "$elapsed" -ge 1 ]]; then
+    ok "lock wait blocks while a helper is still running"
+else
+    fail "lock wait did not wait for a running helper"
+fi
+wait "$live_pid" 2>/dev/null || true
+
 
 # -------------------------------------------------------------------------
 # Layer 2: argument validation (dies before touching the system)

@@ -34,8 +34,12 @@ jobs:
       # The uninstaller deletes files on a real machine. These checks run it end
       # to end against a fake console-user home with stubbed sudo/launchctl/tmutil,
       # so the removal logic is exercised without a network share or a GUI session.
+      # Run under /bin/bash too: macOS ships bash 3.2, which parses some
+      # constructs differently from the Homebrew bash 5 on PATH here.
       - name: Uninstaller behaves
-        run: bash tests/check-uninstall.sh
+        run: |
+          /bin/bash tests/check-uninstall.sh
+          bash tests/check-uninstall.sh
 
       # Everything below needs no network share and no GUI session. The real
       # end-to-end path needs both, so it stays a documented manual test.
