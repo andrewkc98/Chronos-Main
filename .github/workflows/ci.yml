@@ -31,6 +31,12 @@ jobs:
       - name: Generated assets are valid
         run: bash tests/check-generated-assets.sh
 
+      # The uninstaller deletes files on a real machine. These checks run it end
+      # to end against a fake console-user home with stubbed sudo/launchctl/tmutil,
+      # so the removal logic is exercised without a network share or a GUI session.
+      - name: Uninstaller behaves
+        run: bash tests/check-uninstall.sh
+
       # Everything below needs no network share and no GUI session. The real
       # end-to-end path needs both, so it stays a documented manual test.
       - name: Help exits cleanly
