@@ -46,7 +46,8 @@ awk '
 # this, a definition that lands below the cut point silently becomes undefined
 # and the checks below pass vacuously.
 for fn in bundle_is_attached mounted_state_healthy gui_mount_prompt_pending \
-          detach_stale_attachment note_gui_prompt_seen warn_if_gui_prompt_stuck; do
+          detach_stale_attachment note_gui_prompt_seen warn_if_gui_prompt_stuck \
+          mount_attached_volume attached_devices_for_bundle; do
     if ! grep -q "^${fn}()" "$HELPER_FUNCS"; then
         echo "FAIL: ${fn} not found in the extracted helper" >&2
         exit 1
@@ -197,6 +198,69 @@ if [[ "$(detached_p)" == "no" && "$result" == "healthy" ]]; then
     ok "mounted and answering reads: reports healthy, detaches nothing"
 else
     fail "mounted and healthy: detached=$(detached_p) result=${result}"
+fi
+
+echo
+echo "--- mounted_state_healthy: mount what is attached before detaching ---"
+
+# Same harness, but with mount_attached_volume stubbed so we can say whether the
+# already-attached volume mounts.
+run_with_mount_attempt() {
+    local attached="$1" can_mount="$2" prompt="$3"
+    rm -f "${WORK_DIR}/detached" "${WORK_DIR}/mount-tried"
+    (
+        # shellcheck disable=SC1090
+        source "$HELPER_FUNCS" >/dev/null 2>&1
+        # shellcheck disable=SC2034
+        LOG_FILE="${WORK_DIR}/helper.log"
+        # shellcheck disable=SC2034
+        BUNDLE_PATH="$BUNDLE"
+        # shellcheck disable=SC2034
+        VOLUME_MOUNT_POINT="/Volumes/Time Machine Backups"
+
+        is_mountpoint() { false; }
+        probe_path_with_timeout() { true; }
+        bundle_is_attached() { [[ "$attached" == "yes" ]]; }
+        gui_mount_prompt_pending() { [[ "$prompt" == "yes" ]]; }
+        detach_stale_attachment() { echo yes >"${WORK_DIR}/detached"; }
+        mount_attached_volume() {
+            echo yes >"${WORK_DIR}/mount-tried"
+            [[ "$can_mount" == "yes" ]]
+        }
+
+        if mounted_state_healthy; then echo "healthy"; else echo "not-healthy"; fi
+    ) 2>/dev/null
+}
+
+mount_tried_p() { [[ -f "${WORK_DIR}/mount-tried" ]] && echo yes || echo no; }
+
+result="$(run_with_mount_attempt yes yes no)"
+if [[ "$result" == "healthy" && "$(mount_tried_p)" == "yes" && "$(detached_p)" == "no" ]]; then
+    ok "attached and mountable: mounts the existing attachment, no detach, no new prompt"
+else
+    fail "attached and mountable: result=${result} tried=$(mount_tried_p) detached=$(detached_p)"
+fi
+
+result="$(run_with_mount_attempt yes no no)"
+if [[ "$result" == "not-healthy" && "$(mount_tried_p)" == "yes" && "$(detached_p)" == "yes" ]]; then
+    ok "attached but unmountable: falls back to detaching"
+else
+    fail "attached but unmountable: result=${result} tried=$(mount_tried_p) detached=$(detached_p)"
+fi
+
+result="$(run_with_mount_attempt yes yes yes)"
+if [[ "$(mount_tried_p)" == "no" && "$(detached_p)" == "no" ]]; then
+    ok "attached with a prompt open: touches nothing, prompt wins"
+else
+    fail "attached with a prompt open: tried=$(mount_tried_p) detached=$(detached_p)"
+fi
+
+# The regression that mattered on a real machine: attachment alone must never be
+# reported as a confirmed mount.
+if grep -q "Final mount confirmed for attached bundle" "${WORK_DIR}/helper.rendered"; then
+    fail "helper still reports a bare attachment as a confirmed mount"
+else
+    ok "a bare attachment is not reported as a confirmed mount"
 fi
 
 echo

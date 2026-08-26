@@ -2007,6 +2007,69 @@ attached_device_for_bundle() {
 
 # Best-effort by design: called from paths that are not conditionally guarded,
 # so every command here must survive under set -e on its own.
+# Every dev-entry of the attached image, not just the first. The volume we need
+# to mount is usually not entity 0 (that is the partition scheme).
+attached_devices_for_bundle() {
+    local info_plist_file=""
+    local image_index=0
+    local entity_index=0
+    local current_path=""
+    local dev_entry=""
+    local found=1
+
+    info_plist_file="\$(/usr/bin/mktemp "/tmp/${APP_NAME}-hdiutil.XXXXXX")" || return 1
+    /usr/bin/hdiutil info -plist >"\$info_plist_file" 2>/dev/null || { rm -f "\$info_plist_file"; return 1; }
+    /usr/bin/plutil -lint "\$info_plist_file" >/dev/null 2>&1 || { rm -f "\$info_plist_file"; return 1; }
+
+    while true; do
+        current_path="\$(/usr/libexec/PlistBuddy -c "Print :images:\${image_index}:image-path" "\$info_plist_file" 2>/dev/null || true)"
+        [[ -n "\$current_path" ]] || break
+
+        if [[ "\$current_path" == "\$BUNDLE_PATH" ]]; then
+            entity_index=0
+            while true; do
+                dev_entry="\$(/usr/libexec/PlistBuddy -c "Print :images:\${image_index}:system-entities:\${entity_index}:dev-entry" "\$info_plist_file" 2>/dev/null || true)"
+                [[ -n "\$dev_entry" ]] || break
+                printf '%s\\n' "\$dev_entry"
+                found=0
+                entity_index=\$((entity_index + 1))
+            done
+            break
+        fi
+
+        image_index=\$((image_index + 1))
+    done
+
+    rm -f "\$info_plist_file"
+    return "\$found"
+}
+
+# An image can attach -- password accepted, contents decrypted -- without macOS
+# mounting the volume inside it. On a network share that happens routinely. The
+# helper used to read that state as a stale attachment and detach it, which threw
+# away a perfectly good decrypted attachment and made the next 'open' raise a
+# fresh password dialog; on a 5 minute interval that is a dialog every cycle.
+# Mount what is already attached before concluding anything is stale.
+mount_attached_volume() {
+    local dev=""
+    local devices=""
+
+    devices="\$(attached_devices_for_bundle || true)"
+    [[ -n "\$devices" ]] || return 1
+
+    while IFS= read -r dev; do
+        [[ -n "\$dev" ]] || continue
+        /usr/sbin/diskutil mount "\$dev" >/dev/null 2>&1 || continue
+
+        if is_mountpoint "\$VOLUME_MOUNT_POINT"; then
+            log INFO "Mounted the already-attached volume at \$VOLUME_MOUNT_POINT without a new password prompt"
+            return 0
+        fi
+    done <<<"\$devices"
+
+    return 1
+}
+
 detach_stale_attachment() {
     log WARN "Detaching stale sparsebundle attachment for \$BUNDLE_PATH"
 
@@ -2057,7 +2120,13 @@ mounted_state_healthy() {
             return 1
         fi
 
-        log WARN "Sparsebundle is attached but its volume is not mounted; detaching stale attachment"
+        # Cheapest path back to a mounted volume, and the only one that needs no
+        # password: the attachment in hand is already decrypted.
+        if mount_attached_volume; then
+            return 0
+        fi
+
+        log WARN "Sparsebundle is attached but its volume could not be mounted; detaching stale attachment"
         detach_stale_attachment
         return 1
     fi
@@ -2153,8 +2222,12 @@ fi
 
 if wait_for_mountpoint "\$VOLUME_MOUNT_POINT" 5; then
     log INFO "Final mount confirmed at \$VOLUME_MOUNT_POINT"
+elif bundle_is_attached && mount_attached_volume; then
+    log INFO "Final mount confirmed at \$VOLUME_MOUNT_POINT after mounting the attached volume"
 elif bundle_is_attached; then
-    log INFO "Final mount confirmed for attached bundle at \$BUNDLE_PATH"
+    # Attached is not mounted. Time Machine cannot write to an image whose volume
+    # is absent, so this is a failure however healthy the attachment looks.
+    log WARN "Sparsebundle is attached at \$BUNDLE_PATH but \$VOLUME_MOUNT_POINT is still not mounted"
 else
     log WARN "Final mount not confirmed at \$VOLUME_MOUNT_POINT. If encrypted, ensure the password is available via Keychain for unattended remounts."
 fi
