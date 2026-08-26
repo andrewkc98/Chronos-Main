@@ -16,3 +16,6 @@ config
 
 # Local tool settings
 .claude/settings.local.json
+
+# Local agent scratch, not part of the project
+agent-handoff.md
