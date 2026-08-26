@@ -47,7 +47,8 @@ awk '
 # and the checks below pass vacuously.
 for fn in bundle_is_attached mounted_state_healthy gui_mount_prompt_pending \
           detach_stale_attachment note_gui_prompt_seen warn_if_gui_prompt_stuck \
-          mount_attached_volume attached_devices_for_bundle; do
+          mount_attached_volume attached_devices_for_bundle \
+          probe_path_detail probe_denied_by_privacy; do
     if ! grep -q "^${fn}()" "$HELPER_FUNCS"; then
         echo "FAIL: ${fn} not found in the extracted helper" >&2
         exit 1
@@ -154,7 +155,14 @@ run_mounted_state_healthy() {
         VOLUME_MOUNT_POINT="/Volumes/Time Machine Backups"
 
         is_mountpoint() { [[ "$mounted" == "yes" ]]; }
-        probe_path_with_timeout() { [[ "$answers" == "yes" ]]; }
+        # "does not answer" means a hung read, not a privacy denial -- the two
+        # take different branches now, so be explicit about which one this is.
+        # shellcheck disable=SC2034
+        probe_path_detail() {
+            if [[ "$answers" == "yes" ]]; then PROBE_ERROR=""; return 0; fi
+            PROBE_ERROR="timeout"
+            return 1
+        }
         bundle_is_attached() { [[ "$attached" == "yes" ]]; }
         gui_mount_prompt_pending() { [[ "$prompt" == "yes" ]]; }
         detach_stale_attachment() { echo yes >"${WORK_DIR}/detached"; }
@@ -219,7 +227,8 @@ run_with_mount_attempt() {
         VOLUME_MOUNT_POINT="/Volumes/Time Machine Backups"
 
         is_mountpoint() { false; }
-        probe_path_with_timeout() { true; }
+        # shellcheck disable=SC2034
+        probe_path_detail() { PROBE_ERROR=""; return 0; }
         bundle_is_attached() { [[ "$attached" == "yes" ]]; }
         gui_mount_prompt_pending() { [[ "$prompt" == "yes" ]]; }
         detach_stale_attachment() { echo yes >"${WORK_DIR}/detached"; }
@@ -261,6 +270,71 @@ if grep -q "Final mount confirmed for attached bundle" "${WORK_DIR}/helper.rende
     fail "helper still reports a bare attachment as a confirmed mount"
 else
     ok "a bare attachment is not reported as a confirmed mount"
+fi
+
+echo
+echo "--- a Time Machine volume that denies listing is healthy, not stale ---"
+
+# $1 probe rc, $2 what the probe wrote to stderr.
+run_probe_branch() {
+    local probe_rc="$1" probe_err="$2"
+    rm -f "${WORK_DIR}/detached"
+    (
+        # shellcheck disable=SC1090
+        source "$HELPER_FUNCS" >/dev/null 2>&1
+        # shellcheck disable=SC2034
+        LOG_FILE="${WORK_DIR}/helper.log"
+        # shellcheck disable=SC2034
+        BUNDLE_PATH="$BUNDLE"
+        # shellcheck disable=SC2034
+        VOLUME_MOUNT_POINT="/Volumes/Time Machine Backups"
+
+        is_mountpoint() { true; }
+        bundle_is_attached() { false; }
+        gui_mount_prompt_pending() { false; }
+        mount_attached_volume() { false; }
+        detach_stale_attachment() { echo yes >"${WORK_DIR}/detached"; }
+        # PROBE_ERROR is read by the sourced helper's probe_denied_by_privacy.
+        # shellcheck disable=SC2034
+        probe_path_detail() { PROBE_ERROR="$probe_err"; return "$probe_rc"; }
+
+        if mounted_state_healthy; then echo "healthy"; else echo "not-healthy"; fi
+    ) 2>/dev/null
+}
+
+result="$(run_probe_branch 1 "ls: /Volumes/Time Machine Backups: Operation not permitted")"
+if [[ "$result" == "healthy" && "$(detached_p)" == "no" ]]; then
+    ok "listing denied by privacy: treated as healthy, not detached"
+else
+    fail "listing denied by privacy: result=${result} detached=$(detached_p) -- this detaches a working backup volume every check"
+fi
+
+result="$(run_probe_branch 1 "Permission denied")"
+if [[ "$result" == "healthy" && "$(detached_p)" == "no" ]]; then
+    ok "permission denied: treated as healthy, not detached"
+else
+    fail "permission denied: result=${result} detached=$(detached_p)"
+fi
+
+result="$(run_probe_branch 1 "timeout")"
+if [[ "$result" == "not-healthy" && "$(detached_p)" == "yes" ]]; then
+    ok "probe timeout: still treated as a stale mount and detached"
+else
+    fail "probe timeout: result=${result} detached=$(detached_p)"
+fi
+
+result="$(run_probe_branch 1 "ls: /Volumes/Time Machine Backups: Input/output error")"
+if [[ "$result" == "not-healthy" && "$(detached_p)" == "yes" ]]; then
+    ok "I/O error: still treated as a stale mount and detached"
+else
+    fail "I/O error: result=${result} detached=$(detached_p)"
+fi
+
+result="$(run_probe_branch 0 "")"
+if [[ "$result" == "healthy" && "$(detached_p)" == "no" ]]; then
+    ok "probe succeeds outright: healthy"
+else
+    fail "probe succeeds: result=${result} detached=$(detached_p)"
 fi
 
 echo

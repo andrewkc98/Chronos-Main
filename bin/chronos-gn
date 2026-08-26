@@ -2091,10 +2091,64 @@ detach_stale_attachment() {
 # done); returns 1 when the caller should proceed to (re)request a mount,
 # either because nothing is mounted/attached or because a stale attachment was
 # just detached.
+# Same real-I/O probe as probe_path_with_timeout, but keeps stderr so the caller
+# can tell a permissions denial apart from a hang or an I/O error. Sets
+# PROBE_ERROR to the message, or to "timeout" when the read had to be killed.
+PROBE_ERROR=""
+probe_path_detail() {
+    local path="\$1"
+    local timeout="\$2"
+    local err_file=""
+    local pid=""
+    local elapsed=0
+    local rc=0
+
+    PROBE_ERROR=""
+    err_file="\$(/usr/bin/mktemp "/tmp/${APP_NAME}-probe.XXXXXX")" || return 1
+
+    /bin/ls -la "\$path" >/dev/null 2>"\$err_file" &
+    pid=\$!
+
+    while kill -0 "\$pid" 2>/dev/null; do
+        if [[ "\$elapsed" -ge "\$timeout" ]]; then
+            kill -9 "\$pid" 2>/dev/null || true
+            wait "\$pid" 2>/dev/null || true
+            PROBE_ERROR="timeout"
+            rm -f "\$err_file"
+            return 1
+        fi
+        sleep 1 || true
+        elapsed=\$((elapsed + 1))
+    done
+
+    wait "\$pid" 2>/dev/null || rc=\$?
+    PROBE_ERROR="\$(cat "\$err_file" 2>/dev/null || true)"
+    rm -f "\$err_file"
+    return "\$rc"
+}
+
+# macOS denies directory listing on a Time Machine destination to any process
+# without Full Disk Access. This helper does not have it and should not need it,
+# so that denial is the normal state of a healthy backup volume -- it arrives
+# instantly and says nothing about whether the mount is alive.
+probe_denied_by_privacy() {
+    case "\$PROBE_ERROR" in
+        *"Operation not permitted"*|*"Permission denied"*) return 0 ;;
+    esac
+    return 1
+}
+
 mounted_state_healthy() {
     if is_mountpoint "\$VOLUME_MOUNT_POINT"; then
-        if probe_path_with_timeout "\$VOLUME_MOUNT_POINT" 10; then
+        if probe_path_detail "\$VOLUME_MOUNT_POINT" 10; then
             log INFO "Sparsebundle already mounted at \$VOLUME_MOUNT_POINT"
+            return 0
+        fi
+
+        # Expected on every healthy Time Machine destination. Detaching here
+        # would tear down a working mount on every single check.
+        if probe_denied_by_privacy; then
+            log INFO "Sparsebundle mounted at \$VOLUME_MOUNT_POINT; listing is denied without Full Disk Access, which is normal for a Time Machine destination"
             return 0
         fi
 

@@ -88,6 +88,25 @@ grep -A3 "^bundle_is_attached" /usr/local/lib/chronos-gn/chronos-gn-remount.sh
 
 It should capture `hdiutil info` into a variable, not pipe it into `grep -q`.
 
+## Symptom: the volume is detached and remounted every few minutes
+
+The log shows this pair on every cycle while the volume is plainly mounted and working:
+
+```
+[WARN] Mounted volume at /Volumes/... is stale (share is reachable but the volume does not answer reads); detaching for remount
+[WARN] Detaching stale sparsebundle attachment for ...
+```
+
+Fixed in 3.0.0. The health probe listed the volume's contents with `ls -la`, and macOS denies that on a Time Machine destination to any process without Full Disk Access — which the LaunchAgent helper does not have and should not need. The denial is instantaneous, so a healthy volume failed the probe on every run and was torn down. Check it for yourself:
+
+```bash
+ls -la "/Volumes/Time Machine Backups"
+```
+
+`Operation not permitted` from a Terminal without Full Disk Access is the expected, healthy answer. The helper now distinguishes that denial from a timeout or an I/O error; only the latter two mean the mount is stale.
+
+Granting Full Disk Access is **not** required and does not help — the fix is to stop treating the denial as a fault.
+
 ## Symptom: a Finder window opens every time the backup volume mounts
 
 macOS opens a window for a disk image's volume whenever it mounts, so reconnecting to the network interrupts whatever you are doing. Since 3.0.0 the installer turns this off by default — see `SUPPRESS_MOUNT_WINDOW` in [configuration.md](configuration.md). To check the current state:
