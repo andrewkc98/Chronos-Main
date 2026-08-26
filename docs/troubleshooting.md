@@ -59,6 +59,45 @@ The state file holds the epoch seconds of the last unanswered prompt and is remo
 
 Separately: saving the sparsebundle password to Keychain stops most of these prompts appearing at all, because DiskImageMounter can then unlock without asking.
 
+## Symptom: the correct password is rejected with "Could not open <bundle>"
+
+A dialog asks for the sparsebundle password; you type the right one, tick "Remember password in my keychain", and get "Could not open …" whichever button you press. A saved Keychain entry does not help, and more dialogs appear over the following hours.
+
+Fixed in 3.0.0. Two defects compounded:
+
+1. `bundle_is_attached` was written as `hdiutil info | grep -Fq "$BUNDLE_PATH"` while the helper runs under `set -o pipefail`. `grep -q` exits at its first match, `hdiutil` is killed by SIGPIPE, and pipefail promotes that 141 to the pipeline's status — so a **successful** match reported "not attached". Whether it misfired depended on whether `hdiutil`'s output outran the pipe buffer, which is why it struck at random.
+2. Because of (1) the helper never saw the attachment that DiskImageMounter creates while it waits for a password, so it never reconciled it. That attachment outlived the dialog, and every later attempt tried to attach an image that was already attached — which is what macOS reports as "could not open".
+
+Once (1) was fixed, `mounted_state_healthy` would have detached the image out from under a dialog you were part-way through answering. So it now checks for a pending prompt first and waits instead of detaching.
+
+If a prompt is left unanswered for longer than twice `GUI_MOUNT_COOLDOWN`, the helper logs a warning and posts one macOS notification rather than sitting silent. It never dismisses a dialog for you.
+
+If you are on an older build and stuck right now, clear the wreckage by hand:
+
+```bash
+hdiutil info | grep -A2 image-path
+```
+
+Dismiss every open dialog, `hdiutil detach` any device listed for your sparsebundle, then let the next helper cycle mount it cleanly.
+
+Confirm the fix is in your installed helper:
+
+```bash
+grep -A3 "^bundle_is_attached" /usr/local/lib/chronos-gn/chronos-gn-remount.sh
+```
+
+It should capture `hdiutil info` into a variable, not pipe it into `grep -q`.
+
+## Symptom: a Finder window opens every time the backup volume mounts
+
+macOS opens a window for a disk image's volume whenever it mounts, so reconnecting to the network interrupts whatever you are doing. Since 3.0.0 the installer turns this off by default — see `SUPPRESS_MOUNT_WINDOW` in [configuration.md](configuration.md). To check the current state:
+
+```bash
+defaults read com.apple.frameworks.diskimages auto-open-rw-root
+```
+
+`0` means suppressed. If the key does not exist, macOS uses its default of opening the window. Reinstalling with `--keep-mount-window` leaves the preference domain untouched.
+
 ## Symptom: LaunchAgent is installed but remount does not happen
 
 Checks:

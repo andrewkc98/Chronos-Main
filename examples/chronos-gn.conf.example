@@ -80,5 +80,12 @@ NETWORK_URL=smb://nas.example.com/TimeMachine
 # is older than this many days. Set to 0 to disable the check.
 # BACKUP_ALERT_DAYS=7
 
+# Stop macOS opening a Finder window every time the backup volume mounts.
+# Enabled by default; chronos-gn sets auto-open-rw-root and auto-open-ro-root in
+# the com.apple.frameworks.diskimages preference domain for the console user,
+# records whatever was there before, and chronos-gn-uninstall puts it back.
+# Set to false to leave that preference domain untouched.
+# SUPPRESS_MOUNT_WINDOW=true
+
 # Start a first backup once setup succeeds.
 # START_FIRST_BACKUP=true

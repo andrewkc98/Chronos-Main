@@ -45,6 +45,8 @@ LEGACY_LAUNCH_AGENT_PATH=""
 LEGACY_HELPER_DIR="/usr/local/lib/chronos"
 LEGACY_LAUNCH_LOG_DIR=""
 
+readonly MOUNT_WINDOW_PREF_DOMAIN="com.apple.frameworks.diskimages"
+
 usage() {
     cat <<EOF
 ${APP_NAME}-uninstall ${VERSION}
@@ -111,6 +113,16 @@ run_as_root() {
         "$@"
     else
         sudo "$@"
+    fi
+}
+
+run_in_console_user_context() {
+    if [[ "$(id -u)" -eq "$CONSOLE_UID" ]]; then
+        "$@"
+    elif [[ "$(id -u)" -eq 0 ]]; then
+        launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" "$@"
+    else
+        "$@"
     fi
 }
 
@@ -560,6 +572,8 @@ cleanup_logs() {
     remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-remount-monitor.log" "remount monitor log"
 
     remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-gui-mount.state" "GUI mount cooldown state"
+    remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-gui-prompt.state" "GUI password prompt state"
+    remove_file_if_present "${LAUNCH_LOG_DIR}/${APP_NAME}-backup-alert.state" "backup alert throttle state"
 
     if [[ -d "${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock" ]]; then
         if [[ "$DRY_RUN" -ne 1 ]]; then
@@ -589,6 +603,42 @@ cleanup_helper_dir() {
     fi
 }
 
+# chronos-gn records the previous value of every auto-open key it changed. Keys
+# it left alone are absent from that file and are never touched here, so a value
+# the user set themselves survives the uninstall.
+restore_mount_window_pref() {
+    local state_file="${HELPER_DIR}/${APP_NAME}-mount-window.state"
+    local key=""
+    local previous=""
+
+    [[ -f "$state_file" ]] || {
+        info "No recorded mount-window preferences to restore."
+        return 0
+    }
+
+    # This script runs with IFS=$'\n\t', which would hand the whole line to $key.
+    # The record is space-separated, so split on space for this read only.
+    while IFS=' ' read -r key previous || [[ -n "$key" ]]; do
+        [[ -n "$key" ]] || continue
+
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            info "DRY RUN: restore ${MOUNT_WINDOW_PREF_DOMAIN} ${key} to ${previous}"
+            continue
+        fi
+
+        if [[ "$previous" == "unset" ]]; then
+            info "Removing ${MOUNT_WINDOW_PREF_DOMAIN} ${key}, which did not exist before install."
+            run_in_console_user_context defaults delete "$MOUNT_WINDOW_PREF_DOMAIN" "$key" >/dev/null 2>&1 || true
+        else
+            info "Restoring ${MOUNT_WINDOW_PREF_DOMAIN} ${key} to ${previous}."
+            run_in_console_user_context defaults write "$MOUNT_WINDOW_PREF_DOMAIN" "$key" -int "$previous" >/dev/null 2>&1 \
+                || warn "Unable to restore ${MOUNT_WINDOW_PREF_DOMAIN} ${key}; set it back manually with: defaults write ${MOUNT_WINDOW_PREF_DOMAIN} ${key} -int ${previous}"
+        fi
+    done <"$state_file"
+
+    remove_file_if_present "$state_file" "mount-window preference record"
+}
+
 remove_helper_assets() {
     if [[ "$REMOVE_HELPER_ASSETS" -ne 1 ]]; then
         info "Skipping helper asset removal."
@@ -600,6 +650,7 @@ remove_helper_assets() {
     remove_file_if_present "$MONITOR_SCRIPT_PATH" "remount monitor"
     remove_file_if_present "$HELPER_SCRIPT_PATH" "remount helper"
     remove_file_if_present "$LEGACY_APPLESCRIPT_PATH" "legacy AppleScript"
+    restore_mount_window_pref
     cleanup_logs
     cleanup_helper_dir
 }

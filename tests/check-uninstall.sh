@@ -312,6 +312,12 @@ fi
 exit 0
 EOF
 
+cat >"${STUB_DIR}/defaults" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"${STUB_LOG}/defaults"
+exit 0
+EOF
+
 chmod +x "${STUB_DIR}"/*
 
 # Builds a fresh fake install under $1 and echoes nothing; callers use the
@@ -336,9 +342,15 @@ build_sandbox() {
              chronos-gn-gui-mount.state; do
         echo "x" >"${logs}/${f}"
     done
+    echo "1756200000 notified" >"${logs}/chronos-gn-gui-prompt.state"
+    echo "1756200000" >"${logs}/chronos-gn-backup-alert.state"
     mkdir -p "${logs}/chronos-gn-remount.lock"
     echo "999999" >"${logs}/chronos-gn-remount.lock/pid"
     [[ "$stray_log" -eq 1 ]] && echo "keep me" >"${logs}/someone-elses.log"
+
+    # chronos-gn records only the keys it actually changed, one per line.
+    printf 'auto-open-rw-root unset\nauto-open-ro-root 1\n' \
+        >"${root}/helper/chronos-gn-mount-window.state"
 
     echo "helper" >"${root}/helper/chronos-gn-remount.sh"
     echo "monitor" >"${root}/helper/chronos-gn-remount-monitor.sh"
@@ -396,6 +408,12 @@ if [[ "$(stub_log "$SB" launchctl)" == *"bootout"* ]]; then
 else
     ok "dry run does not call launchctl bootout"
 fi
+if [[ -n "$(stub_log "$SB" defaults)" ]]; then
+    fail "dry run wrote to the diskimages preference domain"
+else
+    ok "dry run does not touch the diskimages preference domain"
+fi
+assert_present "${SB}/helper/chronos-gn-mount-window.state"
 
 echo
 echo "--- sandbox: full removal ---"
@@ -433,8 +451,30 @@ if [[ "$tm_calls" == *"BBBB-2222"* ]]; then
 else
     ok "leaves the unrelated Time Machine destination alone"
 fi
+assert_absent "${SB}/home/Library/Logs/chronos-gn/chronos-gn-gui-prompt.state"
+assert_absent "${SB}/home/Library/Logs/chronos-gn/chronos-gn-backup-alert.state"
+assert_absent "${SB}/helper/chronos-gn-mount-window.state"
+
+defaults_calls="$(stub_log "$SB" defaults)"
+assert_contains "$defaults_calls" "delete com.apple.frameworks.diskimages auto-open-rw-root" \
+    "removes an auto-open key that did not exist before install"
+assert_contains "$defaults_calls" "write com.apple.frameworks.diskimages auto-open-ro-root -int 1" \
+    "restores an auto-open key to its pre-install value"
+
 assert_contains "$(stub_log "$SB" launchctl)" "bootout" "unloads the LaunchAgent"
 assert_contains "$full_out" "sparsebundle was not removed" "reports that the sparsebundle was kept"
+
+echo
+echo "--- sandbox: no recorded preferences means none are touched ---"
+SB="${WORK_DIR}/sb-noprefs"
+build_sandbox "$SB"
+rm -f "${SB}/helper/chronos-gn-mount-window.state"
+run_sandbox "$SB" -y >/dev/null
+if [[ -n "$(stub_log "$SB" defaults)" ]]; then
+    fail "reverted a preference chronos-gn never recorded changing"
+else
+    ok "leaves the diskimages preferences alone when nothing was recorded"
+fi
 
 echo
 echo "--- sandbox: a stray file keeps the log directory ---"

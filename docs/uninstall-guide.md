@@ -42,6 +42,12 @@ bash bin/chronos-gn-uninstall --config ~/.config/chronos-gn/config --dry-run --v
 
 Without them the uninstaller looks for the defaults, reports nothing present, and leaves your install untouched.
 
+## Finder mount-window preference
+
+If the installer suppressed the Finder window that opens when the backup volume mounts, it recorded the previous values of `auto-open-rw-root` and `auto-open-ro-root` in `<HELPER_DIR>/chronos-gn-mount-window.state`. The uninstaller restores exactly the keys listed there — a key it never changed is absent from the file and is left alone, so a value you set yourself survives.
+
+The record is removed along with the rest of the helper assets, so `--keep-helper-assets` also keeps the preference as-is.
+
 ## Legacy chronos assets
 
 The uninstaller removes `chronos-gn` assets only. If it finds a pre-3.0 `chronos` install it reports it and leaves it alone; see [migration-from-chronos.md](migration-from-chronos.md) for removing that.

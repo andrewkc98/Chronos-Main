@@ -31,6 +31,7 @@ MIGRATION_APPROVED=0
 LAUNCH_INTERVAL=300
 GUI_MOUNT_COOLDOWN=1800
 BACKUP_ALERT_DAYS=7
+SUPPRESS_MOUNT_WINDOW=1
 SIZE="2000g"
 FILESYSTEM="APFS"
 DESTINATION="/Volumes/TimeMachine"
@@ -77,6 +78,7 @@ SUMMARY_LAUNCHAGENT_STATUS="not-requested"
 SUMMARY_BUNDLE_STATUS="unknown"
 SUMMARY_MIGRATION_STATUS="not-needed"
 SUMMARY_KEYCHAIN_STATUS="not-applicable"
+SUMMARY_MOUNT_WINDOW_STATUS="not-applicable"
 
 LEGACY_LAUNCH_AGENT_LABEL=""
 LEGACY_LAUNCH_AGENT_PATH=""
@@ -118,6 +120,12 @@ Behavior:
                                   long before asking again (default: 1800, 0 disables)
       --backup-alert-days DAYS    Alert when the newest Time Machine backup is older than
                                   this many days (default: 7, 0 disables)
+      --keep-mount-window         Leave macOS to open a Finder window every time the
+                                  backup volume mounts. By default ${APP_NAME} turns that
+                                  off by setting auto-open-rw-root/auto-open-ro-root in
+                                  the com.apple.frameworks.diskimages preference domain
+                                  for the console user; the previous values are recorded
+                                  and restored by ${APP_NAME}-uninstall.
       --no-start-backup           Skip starting the first backup
       --force-clean-partial       Remove known partial bundles without prompting
       --no-migrate                Do not migrate a legacy 'chronos' install if one is found
@@ -487,6 +495,7 @@ apply_config_value() {
         LAUNCH_INTERVAL) LAUNCH_INTERVAL="$value" ;;
         GUI_MOUNT_COOLDOWN) GUI_MOUNT_COOLDOWN="$value" ;;
         BACKUP_ALERT_DAYS) BACKUP_ALERT_DAYS="$value" ;;
+        SUPPRESS_MOUNT_WINDOW) SUPPRESS_MOUNT_WINDOW="$(parse_bool "$value" "SUPPRESS_MOUNT_WINDOW in ${origin}")" ;;
         PASSWORD_ENV_VAR) PASSWORD_ENV_VAR="$value" ;;
         ENABLE_ENCRYPTION) ENABLE_ENCRYPTION="$(parse_bool "$value" "ENABLE_ENCRYPTION in ${origin}")" ;;
         START_FIRST_BACKUP) START_FIRST_BACKUP="$(parse_bool "$value" "START_FIRST_BACKUP in ${origin}")" ;;
@@ -665,6 +674,10 @@ parse_args() {
             --backup-alert-days)
                 BACKUP_ALERT_DAYS="${2:?Missing value for $1}"
                 shift 2
+                ;;
+            --keep-mount-window)
+                SUPPRESS_MOUNT_WINDOW=0
+                shift
                 ;;
             --no-start-backup)
                 START_FIRST_BACKUP=0
@@ -1358,6 +1371,64 @@ configure_tm() {
 # forever at a GUI password prompt nobody is there to answer. This only warns
 # it never fails the run, since the password may simply not have been saved
 # to Keychain yet on a brand-new bundle.
+# macOS opens a Finder window for the backup volume every time it mounts, which
+# interrupts whatever the user happens to be doing. The switch for that lives in
+# a preference domain chronos-gn does not own, so record what was there first and
+# leave the uninstaller enough to put it back exactly as it was.
+readonly MOUNT_WINDOW_PREF_DOMAIN="com.apple.frameworks.diskimages"
+
+apply_mount_window_pref() {
+    local key=""
+    local previous=""
+    local state=""
+    local state_file="${HELPER_DIR}/${APP_NAME}-mount-window.state"
+
+    if [[ "$SUPPRESS_MOUNT_WINDOW" -ne 1 ]]; then
+        SUMMARY_MOUNT_WINDOW_STATUS="left-alone"
+        info "Leaving ${MOUNT_WINDOW_PREF_DOMAIN} auto-open preferences untouched (--keep-mount-window)."
+        return 0
+    fi
+
+    for key in auto-open-rw-root auto-open-ro-root; do
+        previous="$(run_in_console_user_context defaults read "$MOUNT_WINDOW_PREF_DOMAIN" "$key" 2>/dev/null || true)"
+        [[ -n "$previous" ]] || previous="unset"
+
+        if [[ "$previous" == "0" ]]; then
+            info "${MOUNT_WINDOW_PREF_DOMAIN} ${key} is already 0; leaving it alone."
+            continue
+        fi
+
+        info "${MOUNT_WINDOW_PREF_DOMAIN} ${key} was '${previous}'; setting it to 0 so mounting does not raise a Finder window."
+        if ! run_in_console_user_context defaults write "$MOUNT_WINDOW_PREF_DOMAIN" "$key" -bool false >/dev/null 2>&1; then
+            warn "Unable to set ${MOUNT_WINDOW_PREF_DOMAIN} ${key}; a Finder window may still open on mount."
+            SUMMARY_MOUNT_WINDOW_STATUS="failed"
+            return 0
+        fi
+
+        state="${state}${key} ${previous}
+"
+    done
+
+    if [[ -z "$state" ]]; then
+        SUMMARY_MOUNT_WINDOW_STATUS="already-suppressed"
+        return 0
+    fi
+
+    # Only the keys this run actually changed are recorded, so the uninstaller
+    # never reverts a value the user set themselves.
+    if [[ ! -d "$HELPER_DIR" ]]; then
+        run_as_root mkdir -p "$HELPER_DIR" || { warn "Unable to create ${HELPER_DIR}; not recording previous mount-window preferences."; SUMMARY_MOUNT_WINDOW_STATUS="suppressed-unrecorded"; return 0; }
+        run_as_root chmod 0755 "$HELPER_DIR" || true
+    fi
+
+    if printf '%s' "$state" | write_file_atomically "$state_file" 0644; then
+        SUMMARY_MOUNT_WINDOW_STATUS="suppressed"
+    else
+        warn "Set the mount-window preferences but could not record the previous values at ${state_file}."
+        SUMMARY_MOUNT_WINDOW_STATUS="suppressed-unrecorded"
+    fi
+}
+
 warn_if_keychain_entry_missing() {
     if [[ "$ENABLE_ENCRYPTION" -ne 1 ]]; then
         return 0
@@ -1520,6 +1591,7 @@ IFS=\$'\\n\\t'
 LOG_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-remount.log"
 LOCK_DIR="${LAUNCH_LOG_DIR}/${APP_NAME}-remount.lock"
 GUI_MOUNT_STATE_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-gui-mount.state"
+GUI_PROMPT_SEEN_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-gui-prompt.state"
 GUI_MOUNT_COOLDOWN="${GUI_MOUNT_COOLDOWN}"
 DISK_IMAGE_MOUNTER_APP="/System/Library/CoreServices/DiskImageMounter.app"
 NETWORK_URL="${NETWORK_URL}"
@@ -1651,8 +1723,16 @@ bundle_path_ready() {
     return 1
 }
 
+# Deliberately not a pipeline. This helper runs under 'set -o pipefail', and a
+# 'grep -q' reader exits at its first match, leaving hdiutil to die of SIGPIPE;
+# pipefail then promotes that 141 to the pipeline's status, so a successful match
+# reported "not attached" whenever hdiutil outran the pipe buffer. That made the
+# check fail intermittently, which left a stale attachment sitting behind a
+# password dialog that could then never be satisfied.
 bundle_is_attached() {
-    /usr/bin/hdiutil info 2>/dev/null | /usr/bin/grep -Fq "\$BUNDLE_PATH"
+    local info=""
+    info="\$(/usr/bin/hdiutil info 2>/dev/null || true)"
+    [[ "\$info" == *"\$BUNDLE_PATH"* ]]
 }
 
 # Memoized briefly: share_path_ready() now consults this, and that runs inside
@@ -1723,7 +1803,9 @@ end try
 OSA
 
     if ! share_path_ready; then
-        /usr/bin/open "\$NETWORK_URL" >/dev/null 2>&1 || log WARN "Failed to request share mount for \$NETWORK_URL"
+        # -g: mount the share without pulling a Finder window in front of whatever
+        # the user is doing. Finder still performs the mount.
+        /usr/bin/open -g "\$NETWORK_URL" >/dev/null 2>&1 || log WARN "Failed to request share mount for \$NETWORK_URL"
     fi
 
     while [[ "\$elapsed" -lt 30 ]]; do
@@ -1783,6 +1865,53 @@ begin_gui_mount_cooldown() {
 
 clear_gui_mount_cooldown() {
     rm -f "\$GUI_MOUNT_STATE_FILE" >/dev/null 2>&1 || true
+}
+
+# A dialog nobody answers blocks every future mount attempt, and there is no safe
+# automatic way out: dismissing a prompt the user may be part-way through typing
+# into is worse than waiting. So track how long one has been open and escalate to
+# the user once, rather than sitting silent forever.
+note_gui_prompt_seen() {
+    [[ -f "\$GUI_PROMPT_SEEN_FILE" ]] && return 0
+    date +%s >"\$GUI_PROMPT_SEEN_FILE" 2>/dev/null || true
+}
+
+clear_gui_prompt_seen() {
+    rm -f "\$GUI_PROMPT_SEEN_FILE" >/dev/null 2>&1 || true
+}
+
+gui_prompt_stuck_threshold() {
+    if [[ "\$GUI_MOUNT_COOLDOWN" -gt 0 ]]; then
+        printf '%s' "\$((GUI_MOUNT_COOLDOWN * 2))"
+    else
+        printf '3600'
+    fi
+}
+
+warn_if_gui_prompt_stuck() {
+    local state=""
+    local first=""
+    local now=""
+    local age=0
+
+    [[ -f "\$GUI_PROMPT_SEEN_FILE" ]] || return 0
+    state="\$(cat "\$GUI_PROMPT_SEEN_FILE" 2>/dev/null || true)"
+    first="\${state%% *}"
+    [[ "\$first" =~ ^[0-9]+\$ ]] || return 0
+
+    now="\$(date +%s)"
+    age=\$((now - first))
+    [[ "\$age" -ge "\$(gui_prompt_stuck_threshold)" ]] || return 0
+
+    log WARN "A sparsebundle password prompt has been open and unanswered for \${age}s; no remount can proceed until it is dismissed"
+
+    # Notify once, then leave a marker so later runs only log.
+    case "\$state" in
+        *notified*) return 0 ;;
+    esac
+
+    /usr/bin/osascript -e "display notification \"A password prompt for \\\"${VOLUME_NAME}\\\" has been waiting \$((age / 60)) minutes. Dismiss the open dialogs and ${APP_NAME} will remount on its next check.\" with title \"${APP_NAME} needs attention\"" >/dev/null 2>&1 || true
+    printf '%s notified\\n' "\$first" >"\$GUI_PROMPT_SEEN_FILE" 2>/dev/null || true
 }
 
 gui_mount_allowed() {
@@ -1906,12 +2035,28 @@ mounted_state_healthy() {
             return 0
         fi
 
+        if gui_mount_prompt_pending; then
+            log INFO "Volume at \$VOLUME_MOUNT_POINT is not answering reads, but a password prompt is open; leaving the attachment alone"
+            return 1
+        fi
+
         log WARN "Mounted volume at \$VOLUME_MOUNT_POINT is stale (share is reachable but the volume does not answer reads); detaching for remount"
         detach_stale_attachment
         return 1
     fi
 
     if bundle_is_attached; then
+        # An attachment with no mounted volume is also what a sparsebundle looks
+        # like while DiskImageMounter waits for someone to type the password.
+        # Detaching here pulls the image out from under that dialog, so the
+        # password the user eventually types lands on a detached image and fails
+        # with "could not open" -- and the next run opens a fresh dialog over the
+        # same wreckage. A prompt that is still up means wait, not clean up.
+        if gui_mount_prompt_pending; then
+            log INFO "Sparsebundle is attached with a password prompt still open; waiting for it to be answered instead of detaching"
+            return 1
+        fi
+
         log WARN "Sparsebundle is attached but its volume is not mounted; detaching stale attachment"
         detach_stale_attachment
         return 1
@@ -1974,6 +2119,14 @@ attempt_sparsebundle_mount() {
 
 log INFO "${APP_NAME} remount check started"
 
+# Tracked once per run, independently of whether we get as far as a mount attempt.
+if gui_mount_prompt_pending; then
+    note_gui_prompt_seen
+    warn_if_gui_prompt_stuck
+else
+    clear_gui_prompt_seen
+fi
+
 if ! share_path_ready || ! bundle_path_ready; then
     if refresh_share_access; then
         log INFO "Share mount confirmed at \$DESTINATION"
@@ -2019,11 +2172,6 @@ HELPER_TIMEOUT_SECONDS="${LAUNCH_INTERVAL}"
 BACKUP_ALERT_DAYS="${BACKUP_ALERT_DAYS}"
 BACKUP_ALERT_STATE_FILE="${LAUNCH_LOG_DIR}/${APP_NAME}-backup-alert.state"
 
-if [[ "\$HELPER_TIMEOUT_SECONDS" -lt 180 ]]; then
-    log WARN "Helper timeout floored to 180s (requested \${CHECK_INTERVAL}s)"
-    HELPER_TIMEOUT_SECONDS=180
-fi
-
 timestamp() {
     date '+%Y-%m-%d %H:%M:%S'
 }
@@ -2031,6 +2179,13 @@ timestamp() {
 log() {
     printf '[%s] [%s] %s\n' "\$(timestamp)" "\$1" "\$2" >>"\$LOG_FILE"
 }
+
+# Must stay below the log() definition: this runs at load time, and calling log()
+# before it exists kills the monitor outright under 'set -e'.
+if [[ "\$HELPER_TIMEOUT_SECONDS" -lt 180 ]]; then
+    log WARN "Helper timeout floored to 180s (requested \${CHECK_INTERVAL}s)"
+    HELPER_TIMEOUT_SECONDS=180
+fi
 
 run_helper_once() {
     local helper_pid=""
@@ -2246,7 +2401,10 @@ start_first_backup() {
             info "$output"
         fi
         return 0
-    elif printf '%s\n' "$output" | grep -qi "Backup already in progress"; then
+    # Same pipefail/SIGPIPE hazard as bundle_is_attached: a 'grep -q' reader can
+    # leave the writer with a broken pipe, and misreading this branch would die on
+    # a backup that is merely already running. Match in-shell instead.
+    elif [[ "$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')" == *"backup already in progress"* ]]; then
         SUMMARY_BACKUP_STATUS="already-running"
         warn "A Time Machine backup is already in progress."
     else
@@ -2265,6 +2423,7 @@ LaunchAgent       : ${SUMMARY_LAUNCHAGENT_STATUS} (${LAUNCH_AGENT_LABEL})
 Legacy migration  : ${SUMMARY_MIGRATION_STATUS}
 Backup start      : ${SUMMARY_BACKUP_STATUS}
 Keychain entry    : ${SUMMARY_KEYCHAIN_STATUS}
+Mount window      : ${SUMMARY_MOUNT_WINDOW_STATUS}
 Config file       : ${CONFIG_FILE:-none}
 Log file          : ${LOG_FILE}
 EOF
@@ -2311,6 +2470,7 @@ main() {
 
     migrate_legacy_install
     setup_launchagent
+    apply_mount_window_pref
 
     if [[ "$LAUNCHAGENT_ONLY" -ne 1 ]]; then
         start_first_backup

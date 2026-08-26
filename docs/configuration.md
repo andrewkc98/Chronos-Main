@@ -45,6 +45,7 @@ See [`examples/chronos-gn.conf.example`](../examples/chronos-gn.conf.example) fo
 | `LAUNCH_INTERVAL` | `--launch-interval` | `300` | Seconds between remount checks |
 | `GUI_MOUNT_COOLDOWN` | `--gui-mount-cooldown` | `1800` | After an unanswered disk image password prompt, seconds to wait before asking again. `0` disables the cooldown. |
 | `BACKUP_ALERT_DAYS` | `--backup-alert-days` | `7` | Alert when the newest Time Machine backup is older than this many days. `0` disables the check. |
+| `SUPPRESS_MOUNT_WINDOW` | `--keep-mount-window` (to disable) | `true` | Stop macOS opening a Finder window each time the backup volume mounts. |
 | `START_FIRST_BACKUP` | `--no-start-backup` | `true` | Start a backup after setup |
 
 ## Flags with no config equivalent
@@ -82,6 +83,14 @@ Prefer the interactive prompt for the password. Use the environment variable onl
 **`SIZE`** — a sparsebundle only consumes what it uses, but Time Machine treats this as the disk size and will prune backups against it. Sizing it near your share quota is normal; sizing it larger than the share can hold means Time Machine will not prune until the share itself fills.
 
 **`GUI_MOUNT_COOLDOWN`** — this exists because an unanswered password dialog is invisible to every state check the remount helper makes: the volume is not mounted and the image is not attached, so without a cooldown each pass concludes "mount it" and stacks another dialog behind the first. Lower it if you want faster recovery after dismissing a prompt; raise it if you are often away from the machine. Setting it to `0` restores the pre-3.0 behavior, which is not recommended.
+
+**`SUPPRESS_MOUNT_WINDOW`** — macOS opens a Finder window for a disk image's volume every time it mounts, which means an interruption every time you reconnect to the network. The switch lives in `com.apple.frameworks.diskimages`, a preference domain chronos-gn does not own, so the installer reads the current value of `auto-open-rw-root` and `auto-open-ro-root` first, logs it, changes only the keys that were not already `0`, and records the previous values in `<HELPER_DIR>/chronos-gn-mount-window.state`. `chronos-gn-uninstall` restores exactly those keys and leaves any you set yourself alone. Pass `--keep-mount-window` (or set this to `false`) to opt out entirely.
+
+To undo it by hand without running the uninstaller:
+
+```bash
+defaults delete com.apple.frameworks.diskimages auto-open-rw-root
+```
 
 **`BACKUP_ALERT_DAYS`** — the persistent monitor checks `tmutil latestbackup` at most once an hour and compares its date against this threshold. When the newest backup is older than `BACKUP_ALERT_DAYS`, it logs an ERROR and posts a macOS user notification, so a share that silently stopped accepting backups (permissions changed, quota hit, share unmounted for good) does not go unnoticed for weeks. Both the log line and the notification are throttled to once per 24h. Setting it to `0` disables the check entirely.
 

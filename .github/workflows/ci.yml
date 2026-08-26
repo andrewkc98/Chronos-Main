@@ -34,6 +34,14 @@ jobs:
       # The uninstaller deletes files on a real machine. These checks run it end
       # to end against a fake console-user home with stubbed sudo/launchctl/tmutil,
       # so the removal logic is exercised without a network share or a GUI session.
+      # The remount helper is what runs unattended after a network drop. These
+      # checks pin the pipefail/SIGPIPE hazard and the password-prompt guards
+      # that a real install can only exercise by failing overnight.
+      - name: Remount helper behaves
+        run: |
+          /bin/bash tests/check-remount-helper.sh
+          bash tests/check-remount-helper.sh
+
       # Run under /bin/bash too: macOS ships bash 3.2, which parses some
       # constructs differently from the Homebrew bash 5 on PATH here.
       - name: Uninstaller behaves
